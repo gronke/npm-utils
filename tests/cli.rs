@@ -93,3 +93,47 @@ fn init_add_ci_upgrade_roundtrip() {
         "ms still present after upgrade"
     );
 }
+
+#[test]
+#[ignore = "network: fetches debug + ms from the npm registry"]
+fn remove_keeps_a_transitively_required_package() {
+    // Regression for the release review: removing a direct dependency that is also required
+    // transitively must not delete it from node_modules. `debug` depends on `ms`, so after
+    // `remove ms` the package must remain (debug still needs it) with its lockfile entry.
+    let project = tempfile::tempdir().unwrap();
+    let dir = project.path().to_str().unwrap();
+
+    run(
+        npm_utils().args(["init", "--dir", dir, "--name", "demo"]),
+        "init",
+    );
+    // Add both as *direct* dependencies; debug@4 also pulls ms transitively.
+    run(
+        npm_utils().args(["add", "debug@^4", "ms@^2", "--dir", dir]),
+        "add",
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/ms/package.json")
+            .is_file(),
+        "ms installed after add"
+    );
+
+    // Drop the direct `ms` dependency. debug still requires ms, so it must stay installed.
+    run(npm_utils().args(["remove", "ms", "--dir", dir]), "remove");
+
+    let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    assert!(
+        !manifest.contains("\"ms\""),
+        "ms dropped from direct dependencies:\n{manifest}"
+    );
+    assert!(manifest.contains("\"debug\""), "debug remains a direct dep");
+    assert!(
+        project
+            .path()
+            .join("node_modules/ms/package.json")
+            .is_file(),
+        "ms stays installed because debug requires it transitively"
+    );
+}

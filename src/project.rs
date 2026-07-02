@@ -97,8 +97,8 @@ where
 
 /// Upgrade dependencies within their ranges (= `npm update`): compute the plan ([`plan_upgrade`]
 /// against the public registry), apply each [`Change`] to `package.json`, then [`sync`]. Returns the
-/// applied changes and the freshly installed tree. Writes nothing beyond the manifest, lockfile, and
-/// `node_modules/`; a run with no floating updates leaves the manifest byte-identical.
+/// applied changes and the freshly installed tree. A run with no floating updates leaves
+/// `package.json` byte-identical — the manifest is rewritten only when a range actually changed.
 pub fn upgrade(
     dir: &Path,
     packages: &[String],
@@ -109,16 +109,23 @@ pub fn upgrade(
     for change in &changes {
         manifest::upsert_dependency(&mut doc, &change.name, &change.to);
     }
-    write_manifest(dir, &doc)?;
+    // Rewrite the manifest only when something changed: an unconditional write would normalize the
+    // file's whitespace/indentation via `to_pretty`, so a no-op upgrade would not be byte-identical.
+    if !changes.is_empty() {
+        write_manifest(dir, &doc)?;
+    }
     let installed = sync(dir, &doc, detail)?;
     Ok((changes, installed))
 }
 
 /// Remove dependencies (= `npm remove`): drop each named dependency from `package.json`, rewrite the
-/// lock, reinstall the remaining tree, and delete each removed package's `node_modules/<name>`
-/// directory (best-effort — `sync` reinstalls what remains but does not prune a dropped package).
-/// Returns the names actually removed (a name absent from `dependencies` is skipped) and the
-/// reinstalled tree.
+/// lock, and reinstall the resolved tree. Returns the names actually removed (a name absent from
+/// `dependencies` is skipped) and the reinstalled tree.
+///
+/// Pruning is [`sync`]'s job: it rewrites `node_modules/` to exactly the new lockfile, so a package
+/// no longer in the tree is dropped, while one still required transitively by another dependency is
+/// kept. A removed direct dependency that remains a transitive dependency therefore stays installed,
+/// with its `.bin` links intact.
 pub fn remove(
     dir: &Path,
     names: &[String],
@@ -133,10 +140,6 @@ pub fn remove(
     }
     write_manifest(dir, &doc)?;
     let installed = sync(dir, &doc, detail)?;
-    for name in &removed {
-        // Scoped names resolve to `node_modules/@scope/pkg`; a missing directory is not an error.
-        let _ = std::fs::remove_dir_all(dir.join("node_modules").join(name));
-    }
     Ok((removed, installed))
 }
 
@@ -226,6 +229,28 @@ mod tests {
         assert!(
             changes.is_empty(),
             "no floor move → empty plan: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn upgrade_noop_leaves_the_manifest_byte_identical() {
+        // A manifest with non-canonical formatting (4-space indent, no trailing newline) and no
+        // registry dependencies: `plan_upgrade` resolves nothing (offline) and finds no changes, so
+        // the manifest must not be rewritten — otherwise `to_pretty` would reformat it.
+        let dir = tempfile::tempdir().unwrap();
+        let original = r#"{
+    "name": "demo",
+    "version": "1.0.0"
+}"#;
+        std::fs::write(dir.path().join("package.json"), original).unwrap();
+
+        let (changes, _installed) = upgrade(dir.path(), &[], PackumentDetail::Abbreviated).unwrap();
+
+        assert!(changes.is_empty());
+        let after = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert_eq!(
+            after, original,
+            "a no-op upgrade must not rewrite package.json"
         );
     }
 }
