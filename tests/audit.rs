@@ -46,7 +46,8 @@ fn parses_real_osv_fixture_and_synthesizes_range() {
     let record: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/osv-GHSA-jf85-cpcp-j695.json")).unwrap();
 
-    let adv = parse_osv_vuln(&record, "lodash").expect("npm/lodash is an affected package");
+    let adv =
+        parse_osv_vuln(&record, "lodash", "4.17.11").expect("npm/lodash is an affected package");
     assert_eq!(adv.source, "osv");
     assert_eq!(adv.id, "GHSA-jf85-cpcp-j695");
     assert!(adv.aliases.iter().any(|a| a == "CVE-2019-10744"));
@@ -54,8 +55,8 @@ fn parses_real_osv_fixture_and_synthesizes_range() {
     assert_eq!(adv.vulnerable_range, "<4.17.12"); // events [introduced:0, fixed:4.17.12]
 
     // The record also lists a RubyGems package and other npm packages — neither matches "lodash".
-    assert!(parse_osv_vuln(&record, "lodash-rails").is_none());
-    assert!(parse_osv_vuln(&record, "not-a-package").is_none());
+    assert!(parse_osv_vuln(&record, "lodash-rails", "1.0.0").is_none());
+    assert!(parse_osv_vuln(&record, "not-a-package", "1.0.0").is_none());
 }
 
 #[test]
@@ -131,6 +132,74 @@ fn run_audit_groups_counts_and_sets_matched_version() {
     assert_eq!(audit::render_summary(&clean), "found 0 vulnerabilities\n");
 }
 
+/// A source that always fails — proves `run_audit` records the failure and marks the report
+/// incomplete rather than presenting an empty result as clean.
+struct FailingSource;
+
+impl AdvisorySource for FailingSource {
+    fn name(&self) -> &'static str {
+        "failing"
+    }
+    fn query(&self, _components: &[Component]) -> npm_utils::Result<Vec<Advisory>> {
+        Err("simulated endpoint failure".into())
+    }
+}
+
+#[test]
+fn run_audit_records_failed_sources_and_marks_incomplete() {
+    let sources: Vec<Box<dyn AdvisorySource>> = vec![Box::new(FailingSource)];
+    let report = audit::run_audit(&[component("lodash", "4.17.20")], &sources);
+
+    assert!(!report.is_complete());
+    assert_eq!(report.failed_sources, vec!["failing".to_string()]);
+    assert_eq!(report.vulnerabilities.total, 0);
+
+    // The summary flags incompleteness instead of a bare "found 0 vulnerabilities".
+    let summary = audit::render_summary(&report);
+    assert!(
+        summary.contains("INCOMPLETE"),
+        "summary flags incompleteness: {summary}"
+    );
+
+    // JSON carries machine-readable flags a caller can gate on.
+    let doc: serde_json::Value = serde_json::from_str(&audit::render_json(&report)).unwrap();
+    assert_eq!(doc["incomplete"], true);
+    assert_eq!(doc["failed_sources"], serde_json::json!(["failing"]));
+}
+
+#[test]
+fn unknown_severity_confirmed_finding_trips_the_threshold() {
+    // A confirmed finding whose severity could not be determined must stay actionable: it trips
+    // even the default `low` threshold rather than passing silently, and renders as UNKNOWN.
+    let advisory = Advisory {
+        source: "osv",
+        id: "GHSA-unknown".into(),
+        aliases: vec![],
+        package: "demo".into(),
+        vulnerable_range: "=1.2.3".into(),
+        severity: None,
+        title: "unknown severity".into(),
+        url: None,
+        cwe: vec![],
+        cvss_score: None,
+        cvss_vector: None,
+        matched_version: String::new(),
+    };
+    let report = audit::build_report(&[advisory], &[component("demo", "1.2.3")]);
+
+    assert_eq!(report.vulnerabilities.total, 1);
+    assert!(
+        report.exceeds(Severity::Low),
+        "an unknown-severity confirmed finding trips --audit-level low"
+    );
+    assert!(
+        report.exceeds(Severity::Critical),
+        "and any higher level, conservatively"
+    );
+    assert!(report.is_complete(), "no sources failed");
+    assert!(audit::render_summary(&report).contains("UNKNOWN"));
+}
+
 // ----- CLI end-to-end (the `cli` bin and exit codes) -----------------------------------------
 
 #[cfg(feature = "cli")]
@@ -174,6 +243,45 @@ mod cli {
         let out = audit(dir.path(), &[]);
         assert_ne!(out.status.code(), Some(0));
         assert!(String::from_utf8_lossy(&out.stderr).contains("npm-utils:"));
+    }
+
+    /// When every selected source fails, the audit is incomplete: it exits `2` and marks the output
+    /// incomplete rather than reporting a clean tree. Uses an unreachable registry (a refused
+    /// localhost port), so it needs no external network.
+    #[test]
+    fn all_sources_failed_is_incomplete_and_exits_two() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(
+            dir.path(),
+            r#"{
+                "": { "name": "demo", "version": "1.0.0" },
+                "node_modules/lodash": {
+                    "version": "4.17.20",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"
+                }
+            }"#,
+        );
+
+        // The sole source (npm) points at an unreachable registry, so it fails.
+        let out = audit(
+            dir.path(),
+            &["--sources", "npm", "--registry", "https://localhost:1"],
+        );
+        assert_eq!(out.status.code(), Some(2), "all sources failed → exit 2");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("INCOMPLETE"));
+
+        // --allow-incomplete opts back into fail-open (exit 0).
+        let out = audit(
+            dir.path(),
+            &[
+                "--sources",
+                "npm",
+                "--registry",
+                "https://localhost:1",
+                "--allow-incomplete",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "--allow-incomplete → exit 0");
     }
 
     #[test]

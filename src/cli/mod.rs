@@ -220,6 +220,9 @@ enum Command {
         /// Registry base URL for the npm advisory source (default: https://registry.npmjs.org)
         #[arg(long)]
         registry: Option<String>,
+        /// Exit 0 even when every advisory source fails (opt into fail-open on an incomplete audit)
+        #[arg(long)]
+        allow_incomplete: bool,
     },
 }
 
@@ -272,12 +275,14 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             format,
             sources,
             registry,
+            allow_incomplete,
         } => audit::run(
             &dir,
             audit_level,
             format,
             sources.as_deref(),
             registry.as_deref(),
+            allow_incomplete,
         ),
     }
 }

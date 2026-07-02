@@ -46,13 +46,9 @@ impl AdvisorySource for NpmRegistrySource {
         );
         match download::post_json(&url, &gz, Some("gzip"), Some("application/json")) {
             Some(body) => Ok(parse_npm_bulk(&body)),
-            None => {
-                eprintln!(
-                    "npm-utils: npm advisory lookup failed or returned no data; \
-                     audit results may be incomplete"
-                );
-                Ok(Vec::new())
-            }
+            // Unreachable endpoint or unusable response: surface it as an error so `run_audit`
+            // records the source as failed rather than treating it as "no vulnerabilities".
+            None => Err("npm advisory endpoint unreachable or returned no usable data".into()),
         }
     }
 }
