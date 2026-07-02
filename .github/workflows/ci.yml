@@ -64,3 +64,23 @@ jobs:
 
       - name: Build on MSRV
         run: cargo +1.88 build -p npm-utils --all-features
+
+  package:
+    name: publish dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v0.0.3
+        with:
+          toolchain: stable
+
+      - uses: gronke/rust-ci/.github/actions/rust-cache@v0.0.3
+        with:
+          prefix: package
+
+      # Validate the exact artifact crates.io would receive — include rules, package metadata, and
+      # that the packaged crate builds — across all features. No `--locked`: this is a library with
+      # no committed Cargo.lock.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --all-features
