@@ -1,8 +1,9 @@
 //! `audit` — check installed packages against vulnerability advisories from multiple sources.
 //!
-//! Mirrors `npm audit`: prints a report and exits non-zero only when an advisory at or above the
+//! Mirrors `npm audit`: prints a report and exits `1` when an advisory at or above the
 //! `--audit-level` threshold is found. A missing/garbage lockfile is a real error (nonzero with a
-//! message); an unreachable advisory endpoint degrades to "found 0 vulnerabilities" and exit 0.
+//! message). One unreachable source degrades and continues; if *every* selected source fails the
+//! audit is incomplete and exits `2` (fail closed) unless `--allow-incomplete` is given.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -62,6 +63,7 @@ pub(super) fn run(
     format: Format,
     sources: Option<&[SourceKind]>,
     registry: Option<&str>,
+    allow_incomplete: bool,
 ) -> Res {
     let lock_path = dir.join("package-lock.json");
     let text = std::fs::read_to_string(&lock_path)
@@ -77,9 +79,17 @@ pub(super) fn run(
     };
     print!("{out}");
 
-    // A finding at/above the threshold is a nonzero *result*, not a tool error: print to stdout and
-    // exit directly, bypassing `main_with`'s `npm-utils: <err>` path. Flush first — `process::exit`
-    // runs no destructors.
+    // A finding at/above the threshold, and a fully-incomplete audit, are both nonzero *results*
+    // (not tool errors): print to stdout and exit directly, bypassing `main_with`'s
+    // `npm-utils: <err>` path. Flush first — `process::exit` runs no destructors.
+    let all_sources_failed = !active.is_empty() && report.failed_sources.len() == active.len();
+    if all_sources_failed && !allow_incomplete {
+        // Every advisory source failed: the audit did not actually run, so fail closed with a
+        // distinct exit code rather than let a caller mistake it for clean (override with
+        // --allow-incomplete).
+        let _ = std::io::stdout().flush();
+        std::process::exit(2);
+    }
     if report.exceeds(audit_level.into()) {
         let _ = std::io::stdout().flush();
         std::process::exit(1);

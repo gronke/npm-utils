@@ -139,12 +139,15 @@ pub struct ComponentAdvisories {
     pub advisories: Vec<Advisory>,
 }
 
-/// The result of an audit: the vulnerable components (sorted by name then version) and the
-/// per-severity totals across them.
+/// The result of an audit: the vulnerable components (sorted by name then version), the per-severity
+/// totals across them, and the names of any advisory sources that could not be reached — so a caller
+/// can tell an incomplete run from a genuinely clean one.
 #[derive(Debug, Clone)]
 pub struct AuditReport {
     pub findings: Vec<ComponentAdvisories>,
     pub vulnerabilities: Vulnerabilities,
+    /// Advisory sources whose lookup failed; empty when every selected source answered.
+    pub failed_sources: Vec<String>,
 }
 
 impl AuditReport {
@@ -153,11 +156,19 @@ impl AuditReport {
         self.advisories().filter_map(|a| a.severity).max()
     }
 
-    /// Whether any advisory's severity is at or above `level` — the `--audit-level` exit test.
-    /// Advisories without a severity (below the lowest bucket) never trip it.
+    /// Whether the audit reached every selected source. `false` means the report may be missing
+    /// advisories (see [`failed_sources`](Self::failed_sources)).
+    pub fn is_complete(&self) -> bool {
+        self.failed_sources.is_empty()
+    }
+
+    /// Whether any finding is at or above `level` — the `--audit-level` exit test. A confirmed
+    /// finding whose severity could not be determined (`None`) counts as exceeding *any* level: the
+    /// vulnerability is confirmed to affect the installed version, so an unknown severity keeps it
+    /// actionable rather than letting it pass silently.
     pub fn exceeds(&self, level: Severity) -> bool {
         self.advisories()
-            .any(|a| a.severity.is_some_and(|s| s >= level))
+            .any(|a| a.severity.is_none_or(|s| s >= level))
     }
 
     fn advisories(&self) -> impl Iterator<Item = &Advisory> {
@@ -167,32 +178,42 @@ impl AuditReport {
 
 /// An advisory database that can be queried for the vulnerabilities affecting a set of components.
 ///
-/// Implementations should **degrade gracefully**: a network failure or an unreachable endpoint
-/// returns `Ok(vec![])` (no advisories), not an `Err`, so a flaky link never fails the audit run.
-/// An `Err` is reserved for a genuinely fatal misconfiguration.
+/// An implementation returns `Ok(advisories)` when the source answered (an empty vector means "no
+/// advisories"), and `Err` when the source could **not** be reached — an unreachable endpoint, a
+/// network error, or an unusable response. [`run_audit`] records those failures in
+/// [`AuditReport::failed_sources`] so a caller can distinguish an incomplete audit from a clean one;
+/// a single failing source still never sinks the run.
 pub trait AdvisorySource {
     /// A short, stable name (`"npm"`, `"osv"`, …) used in [`Advisory::source`] and diagnostics.
     fn name(&self) -> &'static str;
-    /// Query advisories affecting `components`.
+    /// Query advisories affecting `components`. `Err` means the source was unreachable, not that
+    /// there were no advisories.
     fn query(&self, components: &[Component]) -> crate::Result<Vec<Advisory>>;
 }
 
 /// Query every source, then dedup across sources and keep only advisories that actually apply to an
-/// installed version ([`build_report`]). A source that errors is reported to stderr and skipped — a
-/// single failing source never sinks the run.
+/// installed version ([`build_report`]). A source that fails is reported to stderr, recorded in the
+/// report's [`failed_sources`](AuditReport::failed_sources), and skipped — a single failing source
+/// never sinks the run, but the report is marked incomplete so the caller need not present it as clean.
 pub fn run_audit(components: &[Component], sources: &[Box<dyn AdvisorySource>]) -> AuditReport {
     let mut all = Vec::new();
+    let mut failed_sources = Vec::new();
     for source in sources {
         match source.query(components) {
             Ok(advisories) => all.extend(advisories),
-            Err(e) => eprintln!(
-                "npm-utils: {} advisory source failed: {e}; audit results may be incomplete",
-                source.name()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "npm-utils: {} advisory source failed: {e}; audit results may be incomplete",
+                    source.name()
+                );
+                failed_sources.push(source.name().to_string());
+            }
         }
     }
     let deduped = dedup_advisories(all);
-    build_report(&deduped, components)
+    let mut report = build_report(&deduped, components);
+    report.failed_sources = failed_sources;
+    report
 }
 
 /// The normalized GHSA-/CVE-shaped identity tokens of an advisory (its `id` plus `aliases`),
@@ -292,6 +313,11 @@ pub fn build_report(advisories: &[Advisory], components: &[Component]) -> AuditR
         };
         let mut hits = Vec::new();
         for adv in candidates {
+            // An empty range parses as "any" and would match every installed version; never
+            // over-report on a missing range — skip the advisory instead.
+            if adv.vulnerable_range.trim().is_empty() {
+                continue;
+            }
             let Ok(range) = Range::parse(&adv.vulnerable_range) else {
                 continue;
             };
@@ -312,6 +338,7 @@ pub fn build_report(advisories: &[Advisory], components: &[Component]) -> AuditR
     AuditReport {
         findings,
         vulnerabilities: counts,
+        failed_sources: Vec::new(),
     }
 }
 
@@ -333,7 +360,16 @@ pub fn render_summary(report: &AuditReport) -> String {
     let v = &report.vulnerabilities;
     let mut s = String::new();
     if v.total == 0 {
-        s.push_str("found 0 vulnerabilities\n");
+        if report.failed_sources.is_empty() {
+            s.push_str("found 0 vulnerabilities\n");
+        } else {
+            let _ = writeln!(
+                s,
+                "found 0 vulnerabilities — AUDIT INCOMPLETE: {} source(s) failed ({})",
+                report.failed_sources.len(),
+                report.failed_sources.join(", "),
+            );
+        }
         return s;
     }
     let mut info = String::new();
@@ -354,7 +390,7 @@ pub fn render_summary(report: &AuditReport) -> String {
     for f in &report.findings {
         let _ = write!(s, "\n{}@{}\n", f.component.name, f.component.version);
         for a in &f.advisories {
-            let severity = a.severity.map(Severity::as_str).unwrap_or("info");
+            let severity = a.severity.map(Severity::as_str).unwrap_or("unknown");
             let _ = writeln!(s, "  {:<8} {}  {}", severity.to_uppercase(), a.id, a.title);
             let mut detail = format!("range {}", a.vulnerable_range);
             if !a.cwe.is_empty() {
@@ -365,6 +401,14 @@ pub fn render_summary(report: &AuditReport) -> String {
             }
             let _ = writeln!(s, "    {detail}");
         }
+    }
+    if !report.failed_sources.is_empty() {
+        let _ = writeln!(
+            s,
+            "\nAUDIT INCOMPLETE: {} source(s) failed ({}) — findings may be missing",
+            report.failed_sources.len(),
+            report.failed_sources.join(", "),
+        );
     }
     s
 }
@@ -401,7 +445,7 @@ pub fn render_json(report: &AuditReport) -> String {
             (*name).to_string(),
             json!({
                 "name": name,
-                "severity": max.map(Severity::as_str).unwrap_or("info"),
+                "severity": max.map(Severity::as_str).unwrap_or("unknown"),
                 "versions": versions,
                 "via": via,
             }),
@@ -421,6 +465,10 @@ pub fn render_json(report: &AuditReport) -> String {
                 "total": v.total,
             },
         },
+        // Extensions beyond `npm audit --json` so a machine can distinguish an incomplete audit from
+        // a clean one: `incomplete` is true when any source failed; `failed_sources` names them.
+        "incomplete": !report.failed_sources.is_empty(),
+        "failed_sources": report.failed_sources,
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("serialize audit report");
     s.push('\n');
@@ -633,6 +681,7 @@ mod tests {
         let empty = AuditReport {
             findings: vec![],
             vulnerabilities: Vulnerabilities::default(),
+            failed_sources: vec![],
         };
         assert_eq!(render_summary(&empty), "found 0 vulnerabilities\n");
 
