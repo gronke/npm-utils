@@ -2,10 +2,12 @@
 //!
 //! A batched `POST /v1/querybatch` returns vulnerability ids per query (positionally, one result
 //! list per queried component); each id is then hydrated with `GET /v1/vulns/{id}` for the full
-//! record — structured `affected` ranges, aliases (CVE/GHSA), and severity. OSV records span many
-//! packages and ecosystems, so a record is only relevant when one of its `affected` entries is the
-//! npm package we asked about; that entry's SEMVER `events` are turned into a `>=`/`<` range string
-//! the shared [`Range`](crate::package_json::spec::Range) matcher can post-filter.
+//! record — structured `affected` ranges, aliases (CVE/GHSA), and severity. The endpoint rejects
+//! more than [`QUERYBATCH_LIMIT`] queries per request (`400 "Too many queries."`), so larger
+//! component sets are sent as pages. OSV records span many packages and ecosystems, so a record
+//! is only relevant when one of its `affected` entries is the npm package we asked about; that
+//! entry's SEMVER `events` are turned into a `>=`/`<` range string the shared
+//! [`Range`](crate::package_json::spec::Range) matcher can post-filter.
 
 use std::collections::HashMap;
 
@@ -19,6 +21,11 @@ use crate::sbom::Component;
 const QUERYBATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
 const VULN_URL_BASE: &str = "https://api.osv.dev/v1/vulns";
 
+/// The most queries OSV accepts per `querybatch` request — one more and the endpoint answers
+/// `400 {"code":3,"message":"Too many queries."}` (verified empirically), which the audit would
+/// misreport as an unreachable source. Bigger component sets are paged at this size.
+const QUERYBATCH_LIMIT: usize = 1000;
+
 /// Queries the public OSV database (osv.dev).
 pub struct OsvSource;
 
@@ -31,35 +38,22 @@ impl AdvisorySource for OsvSource {
         if components.is_empty() {
             return Ok(Vec::new());
         }
-        let raw = serde_json::to_vec(&querybatch_body(components))?;
-        let Some(resp) = download::post_json(QUERYBATCH_URL, &raw, None, Some("application/json"))
-        else {
-            // Unreachable endpoint: report it as an error so `run_audit` records OSV as failed
-            // rather than treating it as "no vulnerabilities".
-            return Err("OSV querybatch endpoint unreachable or returned no usable data".into());
-        };
-
-        // `results` is positional: results[i] holds the vuln ids for components[i]. Carry each
-        // component's version too, so a confirmed hit can fall back to an exact `=version` range.
+        // Page the batch at OSV's query cap; each page's positional results are read against
+        // that page's slice, so the pairing survives the split.
         let mut wanted: Vec<(String, String, String)> = Vec::new(); // (name, version, vuln id)
-        if let Some(results) = resp.get("results").and_then(Value::as_array) {
-            for (i, result) in results.iter().enumerate() {
-                let Some(component) = components.get(i) else {
-                    continue;
-                };
-                let Some(vulns) = result.get("vulns").and_then(Value::as_array) else {
-                    continue;
-                };
-                for v in vulns {
-                    if let Some(id) = v.get("id").and_then(Value::as_str) {
-                        wanted.push((
-                            component.name.clone(),
-                            component.version.clone(),
-                            id.to_string(),
-                        ));
-                    }
-                }
-            }
+        for page in components.chunks(QUERYBATCH_LIMIT) {
+            let raw = serde_json::to_vec(&querybatch_body(page))?;
+            let Some(resp) =
+                download::post_json(QUERYBATCH_URL, &raw, None, Some("application/json"))
+            else {
+                // Unreachable endpoint (or a rejected request): report it as an error so
+                // `run_audit` records OSV as failed rather than treating it as "no
+                // vulnerabilities".
+                return Err(
+                    "OSV querybatch endpoint unreachable or returned no usable data".into(),
+                );
+            };
+            wanted.extend(wanted_ids(&resp, page));
         }
 
         // Hydrate each distinct id once (a record can apply to several queried packages).
@@ -80,6 +74,34 @@ impl AdvisorySource for OsvSource {
         }
         Ok(out)
     }
+}
+
+/// The `(name, version, vuln id)` triples a querybatch response names: `results` is positional —
+/// `results[i]` holds the vuln ids for `queried[i]`, so `queried` must be exactly the slice the
+/// request was built from. Each component's version rides along so a confirmed hit can fall back
+/// to an exact `=version` range.
+fn wanted_ids(resp: &Value, queried: &[Component]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    if let Some(results) = resp.get("results").and_then(Value::as_array) {
+        for (i, result) in results.iter().enumerate() {
+            let Some(component) = queried.get(i) else {
+                continue;
+            };
+            let Some(vulns) = result.get("vulns").and_then(Value::as_array) else {
+                continue;
+            };
+            for v in vulns {
+                if let Some(id) = v.get("id").and_then(Value::as_str) {
+                    out.push((
+                        component.name.clone(),
+                        component.version.clone(),
+                        id.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The querybatch body: one `{ package, version }` query per component, in order.
@@ -259,6 +281,60 @@ fn string_array(v: Option<&Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn component(name: &str, version: &str) -> Component {
+        Component {
+            name: name.into(),
+            version: version.into(),
+            purl: format!("pkg:npm/{name}@{version}"),
+            license: None,
+            resolved: None,
+            integrity: None,
+        }
+    }
+
+    #[test]
+    fn querybatch_pages_split_at_the_limit() {
+        // 1001 components → two pages of 1000 + 1 queries; one more query per request and OSV
+        // answers 400 "Too many queries." (the bug that made a 1077-package audit report OSV as
+        // unreachable).
+        let components: Vec<Component> = (0..=QUERYBATCH_LIMIT)
+            .map(|i| component(&format!("pkg{i}"), "1.0.0"))
+            .collect();
+        let query_counts: Vec<usize> = components
+            .chunks(QUERYBATCH_LIMIT)
+            .map(|page| querybatch_body(page)["queries"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(query_counts, [QUERYBATCH_LIMIT, 1]);
+    }
+
+    #[test]
+    fn wanted_ids_maps_results_to_the_queried_page_positionally() {
+        // results[i] pairs with queried[i] — of the queried PAGE, not any global index.
+        let queried = [component("a", "1.0.0"), component("b", "2.0.0")];
+        let resp = json!({ "results": [
+            { "vulns": [{ "id": "GHSA-aaaa" }, { "id": "GHSA-bbbb" }] },
+            {},
+        ]});
+        let wanted = wanted_ids(&resp, &queried);
+        assert_eq!(
+            wanted,
+            [
+                (
+                    "a".to_string(),
+                    "1.0.0".to_string(),
+                    "GHSA-aaaa".to_string()
+                ),
+                (
+                    "a".to_string(),
+                    "1.0.0".to_string(),
+                    "GHSA-bbbb".to_string()
+                ),
+            ]
+        );
+        // A malformed response (no `results`) yields nothing rather than panicking.
+        assert!(wanted_ids(&json!({}), &queried).is_empty());
+    }
 
     #[test]
     fn osv_range_from_simple_introduced_zero_fixed() {
