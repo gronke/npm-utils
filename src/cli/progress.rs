@@ -3,7 +3,7 @@
 //! Status lines are *chatter*, not results: they go to stderr, never stdout (reports stay
 //! machine-consumable), never carry the `npm-utils:` error prefix (that marker is reserved for
 //! errors and warnings, which `--quiet` never suppresses), and vanish under `--quiet`. A TTY gets
-//! a live in-place counter for counted phases; piped/CI stderr gets plain begin/completion lines.
+//! a live in-place line for counted phases; piped/CI stderr gets plain begin/completion lines.
 //! Rust's `Stderr` is unbuffered, so every `eprint!` reaches the terminal immediately — no
 //! flushing needed.
 
@@ -65,27 +65,38 @@ pub(super) struct Phase {
     started: Instant,
     /// Whether a TTY line is open (printed without a trailing newline).
     open: bool,
+    /// Width of the previous TTY render — a `\r` rewrite only overwrites what it prints, so a
+    /// shorter render pads up to this with spaces ([`pad_to_previous`]).
+    last_width: usize,
 }
 
 impl Phase {
     fn begin(sink: Sink, label: String) -> Phase {
+        let opening = begin_line(&label);
         match sink {
             Sink::Off => {}
-            Sink::Plain => eprintln!("{}", begin_line(&label)),
-            Sink::Tty => eprint!("{}", begin_line(&label)),
+            Sink::Plain => eprintln!("{opening}"),
+            Sink::Tty => eprint!("{opening}"),
         }
         Phase {
             sink,
-            label,
             started: Instant::now(),
             open: sink == Sink::Tty,
+            // Clamped so a pathological >TICK_WIDTH label can never force an over-wide tick pad.
+            last_width: match sink {
+                Sink::Tty => opening.chars().count().min(TICK_WIDTH),
+                _ => 0,
+            },
+            label,
         }
     }
 
-    /// Update the live counter — counted phases on a TTY; silent elsewhere.
-    pub(super) fn tick(&mut self, count: usize) {
+    /// Update the live line with `detail` (e.g. `"245 lit-html@3.3.3"`) — counted phases on a
+    /// TTY; silent elsewhere.
+    pub(super) fn tick(&mut self, detail: &str) {
         if self.sink == Sink::Tty {
-            eprint!("\r{}", tick_line(&self.label, count));
+            let line = tick_line(&self.label, detail);
+            eprint!("\r{}", pad_to_previous(&line, &mut self.last_width));
         }
     }
 
@@ -95,7 +106,7 @@ impl Phase {
         match self.sink {
             Sink::Off => {}
             Sink::Plain => eprintln!("{line}"),
-            Sink::Tty => eprint!("\r{line}\n"),
+            Sink::Tty => eprint!("\r{}\n", pad_to_previous(&line, &mut self.last_width)),
         }
         self.open = false;
     }
@@ -125,16 +136,33 @@ fn finish_line(label: &str, summary: &str, secs: f64) -> String {
     format!("{label} ... {summary} ({secs:.1}s)")
 }
 
-/// `{label} ... {count}` capped to [`TICK_WIDTH`] characters (char-boundary safe) — the transient
-/// TTY counter render. The count grows monotonically and the finish line embeds it plus more, so
-/// every rewrite is at least as long as the last and no stale characters survive.
-fn tick_line(label: &str, count: usize) -> String {
-    let line = format!("{label} ... {count}");
+/// `{label} ... {detail}` capped to [`TICK_WIDTH`] characters (char-boundary safe) — the
+/// transient TTY render. Renders shrink and grow as package names change, so the rewrite pads
+/// against the previous width ([`pad_to_previous`]) rather than relying on monotonic length.
+fn tick_line(label: &str, detail: &str) -> String {
+    let line = format!("{label} ... {detail}");
     if line.chars().count() > TICK_WIDTH {
         line.chars().take(TICK_WIDTH).collect()
     } else {
         line
     }
+}
+
+/// Pad `line` with trailing spaces up to the previous render's width — a `\r` rewrite only
+/// overwrites what it prints, so a shorter render would leave the old line's tail on screen —
+/// then record the new *unpadded* width (anything beyond it is already spaces from this pad).
+/// Tick renders are capped at [`TICK_WIDTH`] and the tracker starts clamped to it, so a padded
+/// tick never exceeds [`TICK_WIDTH`]; the newline-terminated finish line may, wrapping once,
+/// harmlessly.
+fn pad_to_previous(line: &str, last_width: &mut usize) -> String {
+    let width = line.chars().count();
+    let padded = if width < *last_width {
+        format!("{line}{}", " ".repeat(*last_width - width))
+    } else {
+        line.to_string()
+    };
+    *last_width = width;
+    padded
 }
 
 #[cfg(test)]
@@ -155,13 +183,30 @@ mod tests {
 
     #[test]
     fn tick_line_caps_width_on_a_char_boundary() {
-        assert_eq!(tick_line("resolving", 37), "resolving ... 37");
+        assert_eq!(
+            tick_line("resolving", "37 lodash@4.17.21"),
+            "resolving ... 37 lodash@4.17.21"
+        );
         // A label pushing the render past the cap — with a multibyte char near the boundary —
         // truncates to exactly TICK_WIDTH chars without splitting a codepoint.
         let wide = format!("{}é", "x".repeat(90));
-        let capped = tick_line(&wide, 12345);
+        let capped = tick_line(&wide, "12345");
         assert_eq!(capped.chars().count(), TICK_WIDTH);
         assert!(capped.starts_with("xxx"));
+    }
+
+    #[test]
+    fn padding_covers_a_shrinking_rewrite() {
+        // A shorter render is padded up to the previous width so no stale tail survives the
+        // `\r` rewrite; the tracker then records the *unpadded* width.
+        let mut last_width = 33;
+        let padded = pad_to_previous(&"x".repeat(20), &mut last_width);
+        assert_eq!(padded, format!("{}{}", "x".repeat(20), " ".repeat(13)));
+        assert_eq!(last_width, 20);
+        // A longer render needs no pad.
+        let unpadded = pad_to_previous(&"y".repeat(25), &mut last_width);
+        assert_eq!(unpadded, "y".repeat(25));
+        assert_eq!(last_width, 25);
     }
 
     #[test]
@@ -173,8 +218,8 @@ mod tests {
             tty: false,
         };
         let mut counted = progress.counted("resolving");
-        counted.tick(1);
-        counted.tick(2);
+        counted.tick("1 a@1.0.0");
+        counted.tick("2 b@2.0.0");
         counted.finish("2 packages");
         let step = progress.step("querying npm advisories");
         drop(step); // unfinished — the Drop backstop must be a no-op off-TTY

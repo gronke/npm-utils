@@ -65,7 +65,7 @@ pub(super) enum SourceKind {
 
 /// Load the source's packages (a lockfile as pinned; a manifest or spec resolved in memory), query
 /// the selected advisory sources, and print the report. Exits `1` when an advisory at or above
-/// `audit_level` is found (after printing), `0` when clean. Status lines — a resolution counter
+/// `audit_level` is found (after printing), `0` when clean. Status lines — a live resolution line
 /// for manifest/spec sources and one begin/done pair per advisory source, emitted even for an
 /// empty component set — go to stderr via `progress`; `--quiet` silences them, never the report
 /// or errors.
@@ -90,13 +90,13 @@ pub(super) fn run(
         SourceEvent::Begin { name } => {
             phase = Some(progress.step(format!("querying {name} advisories")));
         }
-        SourceEvent::Done { advisories, .. } => {
+        SourceEvent::Done { advisories } => {
             if let Some(p) = phase.take() {
                 let plural = if advisories == 1 { "y" } else { "ies" };
                 p.finish(&format!("{advisories} advisor{plural}"));
             }
         }
-        SourceEvent::Failed { .. } => {
+        SourceEvent::Failed => {
             if let Some(p) = phase.take() {
                 p.finish("failed");
             }
@@ -191,7 +191,9 @@ fn components_from_manifest(
         "resolving dependency tree from {}",
         host_of(&registry.base_url)
     ));
-    let resolved = registry.resolve_tree_nested_observed(&roots, |n| phase.tick(n))?;
+    let resolved = registry.resolve_tree_nested_observed(&roots, |n, r| {
+        phase.tick(&format!("{n} {}@{}", r.name, r.version))
+    })?;
     phase.finish(&format!("{} packages", resolved.len()));
     Ok(sbom::components_from_resolved(&resolved))
 }

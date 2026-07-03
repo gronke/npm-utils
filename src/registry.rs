@@ -200,13 +200,13 @@ impl Registry {
         &self,
         roots: &[(String, Range)],
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
-        self.resolve_tree_nested_observed(roots, |_| {})
+        self.resolve_tree_nested_observed(roots, |_, _| {})
     }
 
     /// [`resolve_tree_nested`](Self::resolve_tree_nested) with a per-package progress observer:
-    /// `on_resolved` is called once per resolved package version, with the running total so far —
-    /// the CLI's `audit` verb drives a live stderr counter from it. Resolution behavior (walk
-    /// order, nested semantics, errors, sorting) is identical;
+    /// `on_resolved` is called once per resolved package version, with the running total so far
+    /// and the package just resolved — the CLI's `audit` verb drives a live stderr line from it.
+    /// Resolution behavior (walk order, nested semantics, errors, sorting) is identical;
     /// [`resolve_tree_nested`](Self::resolve_tree_nested) is this with a no-op observer.
     pub(crate) fn resolve_tree_nested_observed<O>(
         &self,
@@ -214,7 +214,7 @@ impl Registry {
         on_resolved: O,
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
-        O: FnMut(usize),
+        O: FnMut(usize, &Resolved),
     {
         self.resolve_walk(roots, |name| self.packument(name), on_resolved, true)
     }
@@ -229,10 +229,14 @@ impl Registry {
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
-        self.resolve_walk(roots, get_packument, |_| {}, false)
+        self.resolve_walk(roots, get_packument, |_, _| {}, false)
     }
 
-    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with an injectable packument source.
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with an injectable packument source —
+    /// a test-only seam ([`resolve_tree_nested`] itself routes through
+    /// [`resolve_tree_nested_observed`](Self::resolve_tree_nested_observed), so nothing outside
+    /// the tests calls this).
+    #[cfg(test)]
     fn resolve_tree_nested_from<F>(
         &self,
         roots: &[(String, Range)],
@@ -241,16 +245,16 @@ impl Registry {
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
-        self.resolve_walk(roots, get_packument, |_| {}, true)
+        self.resolve_walk(roots, get_packument, |_, _| {}, true)
     }
 
     /// The shared graph walk. `nested: false` errors on a version conflict (one version per
     /// name — an installable flat tree); `nested: true` resolves the conflicting range to its
     /// own version instead, as npm would by nesting a second copy. `on_resolved` sees the
-    /// running count after each resolution (a deduped requirement does not tick). Terminates on
-    /// any graph: each iteration either reuses an already-resolved satisfying version or records
-    /// a `(name, version)` pair that wasn't there before, and a packument holds finitely many
-    /// versions.
+    /// running count and the package after each resolution (a deduped requirement does not
+    /// tick). Terminates on any graph: each iteration either reuses an already-resolved
+    /// satisfying version or records a `(name, version)` pair that wasn't there before, and a
+    /// packument holds finitely many versions.
     ///
     /// The walk proceeds in rounds: each takes the whole BFS frontier, prefetches its packuments
     /// concurrently ([`prefetch_packuments`]), and then processes the entries in their original
@@ -265,7 +269,7 @@ impl Registry {
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
-        O: FnMut(usize),
+        O: FnMut(usize, &Resolved),
     {
         use std::collections::{HashMap, VecDeque};
         let mut packuments: HashMap<String, Value> = HashMap::new();
@@ -314,15 +318,19 @@ impl Registry {
                     })?;
                     queue.push_back((dep_name, dep_range));
                 }
-                resolved.entry(name.clone()).or_default().push(Resolved {
+                let package = Resolved {
                     name,
                     version,
                     tarball_url,
                     integrity,
                     license,
-                });
+                };
                 count += 1;
-                on_resolved(count);
+                on_resolved(count, &package);
+                resolved
+                    .entry(package.name.clone())
+                    .or_default()
+                    .push(package);
             }
         }
         let mut out: Vec<Resolved> = resolved.into_values().flatten().collect();
@@ -835,7 +843,7 @@ mod tests {
         let roots = vec![("root".to_string(), "^1".parse().unwrap())];
         let mut seen: Vec<usize> = Vec::new();
         let resolved = Registry::npm()
-            .resolve_walk(&roots, get, |n| seen.push(n), true)
+            .resolve_walk(&roots, get, |n, _| seen.push(n), true)
             .unwrap();
 
         // Every name fetched exactly once, despite ten same-round requirements on `shared`.
@@ -871,7 +879,7 @@ mod tests {
         pkgs.insert("c".into(), packument_with("1.5.0", &[]));
 
         let roots = vec![("a".to_string(), "^1".parse().unwrap())];
-        let mut seen: Vec<usize> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         let resolved = Registry::npm()
             .resolve_walk(
                 &roots,
@@ -880,14 +888,15 @@ mod tests {
                         .cloned()
                         .ok_or_else(|| format!("no packument for {name}").into())
                 },
-                |n| seen.push(n),
+                |n, r| seen.push(format!("{n} {}@{}", r.name, r.version)),
                 true,
             )
             .unwrap();
 
-        // One tick per resolution with the running total, none for the deduped requeue.
-        assert_eq!(seen, [1, 2, 3]);
-        assert_eq!(*seen.last().unwrap(), resolved.len());
+        // One tick per resolution with the running total and the package, none for the deduped
+        // requeue.
+        assert_eq!(seen, ["1 a@1.0.0", "2 b@1.2.0", "3 c@1.5.0"]);
+        assert_eq!(seen.len(), resolved.len());
     }
 
     #[test]
