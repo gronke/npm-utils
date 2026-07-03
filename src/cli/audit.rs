@@ -14,11 +14,12 @@ use std::io::Write as _;
 use clap::ValueEnum;
 use serde_json::Value;
 
+use super::progress::{Phase, Progress};
 use super::source::{classify_file, BareToken, FileKind, Source};
 use super::Res;
 use crate::audit::npm::NpmRegistrySource;
 use crate::audit::osv::OsvSource;
-use crate::audit::{self, AdvisorySource, Severity};
+use crate::audit::{self, AdvisorySource, Severity, SourceEvent};
 use crate::package_json::lock::{registry_roots, Lockfile};
 use crate::package_json::manifest;
 use crate::registry::Registry;
@@ -64,7 +65,10 @@ pub(super) enum SourceKind {
 
 /// Load the source's packages (a lockfile as pinned; a manifest or spec resolved in memory), query
 /// the selected advisory sources, and print the report. Exits `1` when an advisory at or above
-/// `audit_level` is found (after printing), `0` when clean.
+/// `audit_level` is found (after printing), `0` when clean. Status lines — a resolution counter
+/// for manifest/spec sources and one begin/done pair per advisory source, emitted even for an
+/// empty component set — go to stderr via `progress`; `--quiet` silences them, never the report
+/// or errors.
 pub(super) fn run(
     source: &str,
     audit_level: AuditLevel,
@@ -72,13 +76,32 @@ pub(super) fn run(
     sources: Option<&[SourceKind]>,
     registry: Option<&str>,
     allow_incomplete: bool,
+    progress: &Progress,
 ) -> Res {
     let src = Source::parse(source, BareToken::Path)?;
     let reg = Registry::with_base_url(registry.unwrap_or(DEFAULT_REGISTRY));
-    let components = load_components(&src, &reg)?;
+    let components = load_components(&src, &reg, progress)?;
 
     let active = build_sources(sources, registry);
-    let report = audit::run_audit(&components, &active);
+    // Render each source's Begin/Done/Failed as a terminated line pair; every Begin is followed
+    // by exactly one Done/Failed, so `phase` is None again when run_audit_observed returns.
+    let mut phase: Option<Phase> = None;
+    let report = audit::run_audit_observed(&components, &active, |event| match event {
+        SourceEvent::Begin { name } => {
+            phase = Some(progress.step(format!("querying {name} advisories")));
+        }
+        SourceEvent::Done { advisories, .. } => {
+            if let Some(p) = phase.take() {
+                let plural = if advisories == 1 { "y" } else { "ies" };
+                p.finish(&format!("{advisories} advisor{plural}"));
+            }
+        }
+        SourceEvent::Failed { .. } => {
+            if let Some(p) = phase.take() {
+                p.finish("failed");
+            }
+        }
+    });
 
     let out = match format {
         Format::Summary => audit::render_summary(&report),
@@ -111,7 +134,11 @@ pub(super) fn run(
 /// manifest or `name=range` spec resolves its **production** tree against `registry` first —
 /// npm-style nested, so requirements that disagree keep and audit *every* resolved version —
 /// while non-registry deps (git / `file:`) are skipped, as in the lockfile writer.
-fn load_components(source: &Source, registry: &Registry) -> Res<Vec<Component>> {
+fn load_components(
+    source: &Source,
+    registry: &Registry,
+    progress: &Progress,
+) -> Res<Vec<Component>> {
     match source {
         Source::Dir(dir) => {
             let lock = dir.join("package-lock.json");
@@ -119,7 +146,11 @@ fn load_components(source: &Source, registry: &Registry) -> Res<Vec<Component>> 
                 return Ok(sbom::components(&Lockfile::parse(&read_text(&lock)?)?));
             }
             if dir.join("package.json").exists() {
-                return components_from_manifest(&crate::project::read_manifest(dir)?, registry);
+                return components_from_manifest(
+                    &crate::project::read_manifest(dir)?,
+                    registry,
+                    progress,
+                );
             }
             Err(format!("no package-lock.json or package.json in {}", dir.display()).into())
         }
@@ -130,7 +161,7 @@ fn load_components(source: &Source, registry: &Registry) -> Res<Vec<Component>> 
                 FileKind::Manifest => {
                     let doc: Value = serde_json::from_str(&text)
                         .map_err(|e| format!("parsing {}: {e}", path.display()))?;
-                    components_from_manifest(&doc, registry)
+                    components_from_manifest(&doc, registry, progress)
                 }
             }
         }
@@ -139,7 +170,7 @@ fn load_components(source: &Source, registry: &Registry) -> Res<Vec<Component>> 
         Source::Spec { name, range } => {
             let mut doc = manifest::scaffold("npm-utils-audit", "0.0.0");
             manifest::upsert_dependency(&mut doc, name, range.as_deref().unwrap_or("*"));
-            components_from_manifest(&doc, registry)
+            components_from_manifest(&doc, registry, progress)
         }
     }
 }
@@ -149,9 +180,30 @@ fn load_components(source: &Source, registry: &Registry) -> Res<Vec<Component>> 
 /// resolved version is kept and audited — an audit flags issues rather than installs, and when
 /// the tree would contain two versions of a package, both versions' advisories matter. Nothing
 /// touches the filesystem.
-fn components_from_manifest(doc: &Value, registry: &Registry) -> Res<Vec<Component>> {
-    let resolved = registry.resolve_tree_nested(&registry_roots(doc)?)?;
+fn components_from_manifest(
+    doc: &Value,
+    registry: &Registry,
+    progress: &Progress,
+) -> Res<Vec<Component>> {
+    // Roots first: a garbage manifest errors before any status line begins.
+    let roots = registry_roots(doc)?;
+    let mut phase = progress.counted(format!(
+        "resolving dependency tree from {}",
+        host_of(&registry.base_url)
+    ));
+    let resolved = registry.resolve_tree_nested_observed(&roots, |n| phase.tick(n))?;
+    phase.finish(&format!("{} packages", resolved.len()));
     Ok(sbom::components_from_resolved(&resolved))
+}
+
+/// The display host of a registry base URL — scheme and path stripped
+/// (`https://r.example/npm/` → `r.example`); purely cosmetic, for the resolution status line.
+fn host_of(url: &str) -> &str {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest)
 }
 
 fn read_text(path: &std::path::Path) -> Res<String> {

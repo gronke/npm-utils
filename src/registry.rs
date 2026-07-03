@@ -196,7 +196,23 @@ impl Registry {
         &self,
         roots: &[(String, Range)],
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
-        self.resolve_tree_nested_from(roots, |name| self.packument(name))
+        self.resolve_tree_nested_observed(roots, |_| {})
+    }
+
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with a per-package progress observer:
+    /// `on_resolved` is called once per resolved package version, with the running total so far —
+    /// the CLI's `audit` verb drives a live stderr counter from it. Resolution behavior (walk
+    /// order, nested semantics, errors, sorting) is identical;
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) is this with a no-op observer.
+    pub(crate) fn resolve_tree_nested_observed<O>(
+        &self,
+        roots: &[(String, Range)],
+        on_resolved: O,
+    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        O: FnMut(usize),
+    {
+        self.resolve_walk(roots, |name| self.packument(name), on_resolved, true)
     }
 
     /// [`resolve_tree`](Self::resolve_tree) with an injectable packument source, so the
@@ -209,7 +225,7 @@ impl Registry {
     where
         F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
     {
-        self.resolve_walk(roots, get_packument, false)
+        self.resolve_walk(roots, get_packument, |_| {}, false)
     }
 
     /// [`resolve_tree_nested`](Self::resolve_tree_nested) with an injectable packument source.
@@ -221,27 +237,31 @@ impl Registry {
     where
         F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
     {
-        self.resolve_walk(roots, get_packument, true)
+        self.resolve_walk(roots, get_packument, |_| {}, true)
     }
 
     /// The shared graph walk. `nested: false` errors on a version conflict (one version per
     /// name — an installable flat tree); `nested: true` resolves the conflicting range to its
-    /// own version instead, as npm would by nesting a second copy. Terminates on any graph:
-    /// each iteration either reuses an already-resolved satisfying version or records a
-    /// `(name, version)` pair that wasn't there before, and a packument holds finitely many
+    /// own version instead, as npm would by nesting a second copy. `on_resolved` sees the
+    /// running count after each resolution (a deduped requirement does not tick). Terminates on
+    /// any graph: each iteration either reuses an already-resolved satisfying version or records
+    /// a `(name, version)` pair that wasn't there before, and a packument holds finitely many
     /// versions.
-    fn resolve_walk<F>(
+    fn resolve_walk<F, O>(
         &self,
         roots: &[(String, Range)],
         mut get_packument: F,
+        mut on_resolved: O,
         nested: bool,
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+        O: FnMut(usize),
     {
         use std::collections::{HashMap, VecDeque};
         let mut packuments: HashMap<String, Value> = HashMap::new();
         let mut resolved: HashMap<String, Vec<Resolved>> = HashMap::new();
+        let mut count = 0usize;
         let mut queue: VecDeque<(String, Range)> = roots.iter().cloned().collect();
 
         while let Some((name, range)) = queue.pop_front() {
@@ -287,6 +307,8 @@ impl Registry {
                 integrity,
                 license,
             });
+            count += 1;
+            on_resolved(count);
         }
         let mut out: Vec<Resolved> = resolved.into_values().flatten().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
@@ -694,6 +716,37 @@ mod tests {
             .map(|r| format!("{}@{}", r.name, r.version))
             .collect();
         assert_eq!(pairs, ["a@1.0.0", "a@2.0.0", "b@1.0.0"]);
+    }
+
+    #[test]
+    fn resolve_walk_reports_each_resolution_to_the_observer() {
+        // a@1 → {b ^1, c ^1}; b@1 → {c ^1} — c's second requirement dedupes and must NOT tick.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "a".into(),
+            packument_with("1.0.0", &[("b", "^1"), ("c", "^1")]),
+        );
+        pkgs.insert("b".into(), packument_with("1.2.0", &[("c", "^1")]));
+        pkgs.insert("c".into(), packument_with("1.5.0", &[]));
+
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let mut seen: Vec<usize> = Vec::new();
+        let resolved = Registry::npm()
+            .resolve_walk(
+                &roots,
+                |name| {
+                    pkgs.get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("no packument for {name}").into())
+                },
+                |n| seen.push(n),
+                true,
+            )
+            .unwrap();
+
+        // One tick per resolution with the running total, none for the deduped requeue.
+        assert_eq!(seen, [1, 2, 3]);
+        assert_eq!(*seen.last().unwrap(), resolved.len());
     }
 
     #[test]
