@@ -180,9 +180,27 @@ fn parse_alternative(alt: &str) -> Result<VersionReq, Box<dyn std::error::Error 
         )
         .into());
     }
-    Ok(VersionReq::parse(
-        &alt.split_whitespace().collect::<Vec<_>>().join(", "),
-    )?)
+    Ok(VersionReq::parse(&join_comparators(alt))?)
+}
+
+/// Join npm's space-separated comparators with the commas `semver` expects, re-attaching an
+/// operator that node-semver allows to stand apart from its version: `>= 1.43.0 < 2` (as
+/// published, e.g., by `compressible` for `mime-db`) → `>=1.43.0, <2`. A trailing or doubled
+/// operator is left as-is for `semver` to reject.
+fn join_comparators(alt: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for token in alt.split_whitespace() {
+        match parts.last_mut() {
+            Some(prev) if is_bare_operator(prev) => prev.push_str(token),
+            _ => parts.push(token.to_string()),
+        }
+    }
+    parts.join(", ")
+}
+
+/// A comparator operator standing alone (its version detached by whitespace).
+fn is_bare_operator(s: &str) -> bool {
+    matches!(s, ">" | "<" | ">=" | "<=" | "=" | "^" | "~")
 }
 
 /// Whether `s` has the shape of an npm dist-tag — a bare word `[A-Za-z][A-Za-z0-9-]*` — as opposed
@@ -294,6 +312,17 @@ mod tests {
         let and = Range::parse(">=1.6.2 <2.0.0").unwrap();
         assert!(and.matches(&v("1.9.0")));
         assert!(!and.matches(&v("2.0.0")));
+
+        // node-semver also allows whitespace between an operator and its version — published
+        // trees carry it (compressible@2.0.18 declares mime-db ">= 1.43.0 < 2").
+        let detached = Range::parse(">= 1.43.0 < 2").unwrap();
+        assert!(detached.matches(&v("1.43.0")));
+        assert!(detached.matches(&v("1.52.0")));
+        assert!(!detached.matches(&v("1.42.0")));
+        assert!(!detached.matches(&v("2.0.0")));
+        let caret = Range::parse("^ 1.2.3").unwrap();
+        assert!(caret.matches(&v("1.9.0")));
+        assert!(!caret.matches(&v("2.0.0")));
 
         // A bare version is an exact pin; `*`/empty/`Range::any` match anything.
         assert!(Range::parse("1.2.3").unwrap().matches(&v("1.2.3")));
