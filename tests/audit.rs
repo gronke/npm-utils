@@ -213,13 +213,21 @@ mod cli {
         std::fs::write(dir.join("package-lock.json"), lock).unwrap();
     }
 
-    fn audit(dir: &std::path::Path, extra: &[&str]) -> std::process::Output {
-        let mut args = vec!["audit", dir.to_str().unwrap()];
-        args.extend_from_slice(extra);
+    /// Run `npm-utils audit <source> <extra…>`; `source` is any dir path, file path, or spec token.
+    fn audit(source: impl AsRef<std::ffi::OsStr>, extra: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_npm-utils"))
-            .args(args)
+            .arg("audit")
+            .arg(source.as_ref())
+            .args(extra)
             .output()
             .expect("spawn npm-utils audit")
+    }
+
+    fn write_manifest(dir: &std::path::Path, dependencies_json: &str) {
+        let manifest = format!(
+            r#"{{ "name": "demo", "version": "1.0.0", "dependencies": {dependencies_json} }}"#
+        );
+        std::fs::write(dir.join("package.json"), manifest).unwrap();
     }
 
     /// An empty tree makes no network calls (the sources short-circuit on empty input), so this is
@@ -236,13 +244,100 @@ mod cli {
         assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
     }
 
-    /// A missing lockfile is a real error: nonzero exit with an `npm-utils:` message on stderr.
+    /// A directory with neither a lockfile nor a manifest is a real error: nonzero exit with an
+    /// `npm-utils:` message naming both candidates.
     #[test]
-    fn missing_lockfile_errors() {
+    fn missing_lockfile_and_manifest_errors() {
         let dir = tempfile::tempdir().unwrap();
         let out = audit(dir.path(), &[]);
         assert_ne!(out.status.code(), Some(0));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("npm-utils:"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("npm-utils:"), "{stderr}");
+        assert!(
+            stderr.contains("no package-lock.json or package.json"),
+            "{stderr}"
+        );
+    }
+
+    /// The regression for `audit <path>/package.json` (formerly ENOTDIR): an explicit manifest path
+    /// audits that manifest, resolved in memory — a zero-dep manifest needs no network — and never
+    /// writes a lockfile.
+    #[test]
+    fn explicit_manifest_path_audits_in_memory_without_writing_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+        assert!(
+            !dir.path().join("package-lock.json").exists(),
+            "a manifest audit must not write a lockfile"
+        );
+    }
+
+    /// An explicit lockfile path is used as given.
+    #[test]
+    fn explicit_lockfile_path_is_used_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(
+            dir.path(),
+            r#"{ "": { "name": "demo", "version": "1.0.0" } }"#,
+        );
+        let out = audit(dir.path().join("package-lock.json"), &[]);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
+    /// A lock under a nonstandard name is still recognized — by its `lockfileVersion` content.
+    #[test]
+    fn renamed_lockfile_is_classified_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mylock.json"),
+            r#"{ "name": "demo", "version": "1.0.0", "lockfileVersion": 3, "packages": { "": { "name": "demo", "version": "1.0.0" } } }"#,
+        )
+        .unwrap();
+        let out = audit(dir.path().join("mylock.json"), &[]);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
+    /// Given a directory holding both files, the lockfile wins. The manifest names a package that
+    /// can never resolve, so a clean exit is only explainable by the (empty) lock — online or off.
+    #[test]
+    fn directory_prefers_the_lockfile_over_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(
+            dir.path(),
+            r#"{ "": { "name": "demo", "version": "1.0.0" } }"#,
+        );
+        write_manifest(
+            dir.path(),
+            r#"{ "this-package-does-not-exist-npm-utils-e2e": "^1" }"#,
+        );
+        let out = audit(dir.path(), &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the lock, not the manifest, decides: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A directory with only a manifest falls back to resolving it in memory.
+    #[test]
+    fn directory_falls_back_to_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path(), &[]);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+        assert!(!dir.path().join("package-lock.json").exists());
     }
 
     /// When every selected source fails, the audit is incomplete: it exits `2` and marks the output
@@ -282,6 +377,43 @@ mod cli {
             ],
         );
         assert_eq!(out.status.code(), Some(0), "--allow-incomplete → exit 0");
+    }
+
+    /// A manifest whose parents disagree on a package (a direct `glob` 5 pin vs globby@0.1.1's
+    /// frozen `glob ^4.0.2`) resolves nested like npm and audits every version — the flat
+    /// installer's "version conflict" error must not reach the audit.
+    #[test]
+    #[ignore = "network: resolves via the npm registry and hits the advisory endpoints"]
+    fn live_audit_manifest_with_conflicting_requirements_still_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), r#"{ "glob": "5.0.15", "globby": "0.1.1" }"#);
+        let out = audit(dir.path().join("package.json"), &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("version conflict"),
+            "nested resolution tolerates the glob 4/5 split: {stderr}"
+        );
+        // Reaching a report at all (clean, findings, or incomplete) proves resolution succeeded.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("found "),
+            "a report was printed; stderr: {stderr}"
+        );
+    }
+
+    /// A `name=range` source resolves the full production tree via the registry and audits it —
+    /// an exact vulnerable pin keeps the outcome deterministic.
+    #[test]
+    #[ignore = "network: resolves via the npm registry and hits the advisory endpoints"]
+    fn live_audit_spec_source_flags_a_vulnerable_pin() {
+        let out = audit("lodash=4.17.11", &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "vulns at default level → exit 1"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("lodash@4.17.11"), "{stdout}");
+        assert!(stdout.contains("GHSA-"), "{stdout}");
     }
 
     #[test]

@@ -173,7 +173,9 @@ impl Registry {
     ///
     /// MVP limitation: a single version per package name. Two *incompatible*
     /// requirements on the same package — a genuine conflict npm would resolve by
-    /// nesting — is reported as an error rather than silently mis-resolved.
+    /// nesting — is reported as an error rather than silently mis-resolved;
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) is the conflict-tolerant
+    /// sibling that keeps a version per disagreeing range instead.
     pub fn resolve_tree(
         &self,
         roots: &[(String, Range)],
@@ -181,32 +183,82 @@ impl Registry {
         self.resolve_tree_from(roots, |name| self.packument(name))
     }
 
+    /// Resolve the transitive dependency graph of `roots` the way npm's **nested**
+    /// `node_modules` does: a requirement an already-resolved version satisfies reuses it
+    /// (npm's dedupe), and requirements that disagree keep one resolved version *per range*
+    /// instead of erroring like [`resolve_tree`](Self::resolve_tree). Returns the packages
+    /// sorted by name, then version — possibly several versions of one name.
+    ///
+    /// This is the resolution an *audit* wants: every version the installed tree would
+    /// contain is a version whose advisories matter. Installs keep
+    /// [`resolve_tree`](Self::resolve_tree)'s flat one-version-per-name guarantee.
+    pub fn resolve_tree_nested(
+        &self,
+        roots: &[(String, Range)],
+    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
+        self.resolve_tree_nested_from(roots, |name| self.packument(name))
+    }
+
     /// [`resolve_tree`](Self::resolve_tree) with an injectable packument source, so the
     /// graph walk can be unit-tested without the network.
     fn resolve_tree_from<F>(
         &self,
         roots: &[(String, Range)],
+        get_packument: F,
+    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.resolve_walk(roots, get_packument, false)
+    }
+
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with an injectable packument source.
+    fn resolve_tree_nested_from<F>(
+        &self,
+        roots: &[(String, Range)],
+        get_packument: F,
+    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.resolve_walk(roots, get_packument, true)
+    }
+
+    /// The shared graph walk. `nested: false` errors on a version conflict (one version per
+    /// name — an installable flat tree); `nested: true` resolves the conflicting range to its
+    /// own version instead, as npm would by nesting a second copy. Terminates on any graph:
+    /// each iteration either reuses an already-resolved satisfying version or records a
+    /// `(name, version)` pair that wasn't there before, and a packument holds finitely many
+    /// versions.
+    fn resolve_walk<F>(
+        &self,
+        roots: &[(String, Range)],
         mut get_packument: F,
+        nested: bool,
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
     {
         use std::collections::{HashMap, VecDeque};
         let mut packuments: HashMap<String, Value> = HashMap::new();
-        let mut resolved: HashMap<String, Resolved> = HashMap::new();
+        let mut resolved: HashMap<String, Vec<Resolved>> = HashMap::new();
         let mut queue: VecDeque<(String, Range)> = roots.iter().cloned().collect();
 
         while let Some((name, range)) = queue.pop_front() {
             if let Some(existing) = resolved.get(&name) {
-                if range.matches(&existing.version) {
+                if existing.iter().any(|r| range.matches(&r.version)) {
                     continue; // already resolved to a satisfying version — dedup
                 }
-                return Err(format!(
-                    "version conflict for `{name}`: resolved {} but also required `{range}` \
-                     (flat node_modules install resolves one version per package)",
-                    existing.version
-                )
-                .into());
+                if !nested {
+                    return Err(format!(
+                        "version conflict for `{name}`: resolved {} but also required `{range}` \
+                         (flat node_modules install resolves one version per package)",
+                        existing[0].version
+                    )
+                    .into());
+                }
+                // Nested: fall through and resolve this range's own version. The pick can't
+                // duplicate an existing one — a satisfying existing version was handled above.
             }
             if !packuments.contains_key(&name) {
                 let doc = get_packument(&name)?;
@@ -228,19 +280,16 @@ impl Registry {
                 })?;
                 queue.push_back((dep_name, dep_range));
             }
-            resolved.insert(
-                name.clone(),
-                Resolved {
-                    name,
-                    version,
-                    tarball_url,
-                    integrity,
-                    license,
-                },
-            );
+            resolved.entry(name.clone()).or_default().push(Resolved {
+                name,
+                version,
+                tarball_url,
+                integrity,
+                license,
+            });
         }
-        let mut out: Vec<Resolved> = resolved.into_values().collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out: Vec<Resolved> = resolved.into_values().flatten().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
         Ok(out)
     }
 }
@@ -577,6 +626,74 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("version conflict"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_tree_nested_keeps_a_version_per_conflicting_range() {
+        // The exact graph the flat resolver rejects above: root wants x ^1, y wants x ^2.
+        // Nested resolution keeps both x versions — what an installed tree would contain.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "x".into(),
+            json!({ "versions": {
+                "1.0.0": { "dist": { "tarball": "https://r/x1.tgz" } },
+                "2.0.0": { "dist": { "tarball": "https://r/x2.tgz" } }
+            }}),
+        );
+        pkgs.insert("y".into(), packument_with("1.0.0", &[("x", "^2")]));
+
+        let roots = vec![
+            ("x".to_string(), "^1".parse().unwrap()),
+            ("y".to_string(), "^1".parse().unwrap()),
+        ];
+        let resolved = Registry::npm()
+            .resolve_tree_nested_from(&roots, |name| {
+                pkgs.get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("no packument for {name}").into())
+            })
+            .unwrap();
+
+        let pairs: Vec<String> = resolved
+            .iter()
+            .map(|r| format!("{}@{}", r.name, r.version))
+            .collect();
+        assert_eq!(
+            pairs,
+            ["x@1.0.0", "x@2.0.0", "y@1.0.0"],
+            "both conflicting x versions kept, sorted by name then version"
+        );
+    }
+
+    #[test]
+    fn resolve_tree_nested_dedupes_and_terminates_on_a_conflicting_cycle() {
+        // a@1 → b ^1; b@1 → a ^2 (conflicts with the root's a@1); a@2 → b ^1 (cycle, already
+        // satisfied). The walk must dedupe satisfying ranges, nest the conflicting one exactly
+        // once, and terminate.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "a".into(),
+            json!({ "versions": {
+                "1.0.0": { "dist": { "tarball": "https://r/a1.tgz" }, "dependencies": { "b": "^1" } },
+                "2.0.0": { "dist": { "tarball": "https://r/a2.tgz" }, "dependencies": { "b": "^1" } }
+            }}),
+        );
+        pkgs.insert("b".into(), packument_with("1.0.0", &[("a", "^2")]));
+
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let resolved = Registry::npm()
+            .resolve_tree_nested_from(&roots, |name| {
+                pkgs.get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("no packument for {name}").into())
+            })
+            .unwrap();
+
+        let pairs: Vec<String> = resolved
+            .iter()
+            .map(|r| format!("{}@{}", r.name, r.version))
+            .collect();
+        assert_eq!(pairs, ["a@1.0.0", "a@2.0.0", "b@1.0.0"]);
     }
 
     #[test]

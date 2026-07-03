@@ -202,15 +202,7 @@ pub fn render_v3_from_manifest(
     registry: &Registry,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let direct = manifest::dependencies(doc);
-    let roots: Vec<(String, spec::Range)> = direct
-        .iter()
-        .filter(|(_, range)| spec::Spec::parse(range).is_registry())
-        .map(
-            |(name, range)| -> Result<(String, spec::Range), Box<dyn std::error::Error + Send + Sync>> {
-                Ok((name.clone(), spec::Range::parse(range)?))
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
+    let roots = registry_roots(doc)?;
 
     let entries: Vec<LockEntry> = registry
         .resolve_tree(&roots)?
@@ -230,6 +222,19 @@ pub fn render_v3_from_manifest(
         .and_then(Value::as_str)
         .unwrap_or("0.0.0");
     Ok(render_v3(name, version, &direct, &entries))
+}
+
+/// A manifest's **registry** `dependencies` as resolvable roots — entries whose spec is a
+/// registry range (git / `file:` / tarball specs are skipped), each parsed by the npm range
+/// grammar. Shared by [`render_v3_from_manifest`] and the CLI audit's in-memory resolution.
+pub(crate) fn registry_roots(
+    doc: &Value,
+) -> Result<Vec<(String, spec::Range)>, Box<dyn std::error::Error + Send + Sync>> {
+    manifest::dependencies(doc)
+        .iter()
+        .filter(|(_, range)| spec::Spec::parse(range).is_registry())
+        .map(|(name, range)| Ok((name.clone(), spec::Range::parse(range)?)))
+        .collect()
 }
 
 /// Read a `package.json`-shaped manifest and (re)write its `package-lock.json` from the

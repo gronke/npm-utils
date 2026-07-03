@@ -13,7 +13,7 @@ See [CLI](#cli).
 
 ```toml
 [dependencies]
-npm-utils = "0.5"   # Rust 1.77+
+npm-utils = "0.6"   # Rust 1.88+
 ```
 
 Composable modules — the full API is on **[docs.rs](https://docs.rs/npm-utils)**:
@@ -101,7 +101,7 @@ so every verb works standalone *or* as a cargo subcommand (`npm-utils add lit` �
 
 ```console
 $ npm-utils --help
-Pure-Rust npm registry tools: install · ci · add · init · upgrade · sbom · audit
+Pure-Rust npm registry tools: install · ci · add · remove · init · upgrade · search · sbom · audit
 
 Usage: npm-utils [OPTIONS] <COMMAND>
 
@@ -109,12 +109,14 @@ Commands:
   install   Resolve dependencies, write package-lock.json, install node_modules/ (npm install)
   ci        Install the exact tree package-lock.json pins (npm ci)
   add       Add packages to package.json, write the lock, and install (npm add)
+  remove    Remove packages from package.json, refresh the lock, reinstall (npm remove)
   init      Create a package.json (npm init -y)
   upgrade   Re-resolve within ranges, refresh the lock, and install (npm update)
   resolve   Print the newest version matching a range (version, tarball, integrity)
   download  Download a package tarball — resolve and fetch, no install
+  search    Search the registry for packages (npm search)
   sbom      Bill of materials from package-lock.json: license summary, CycloneDX, or SPDX
-  audit     Check installed packages against vulnerability advisories (npm audit)
+  audit     Check packages against vulnerability advisories (npm audit)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -125,6 +127,13 @@ Options:
 ```
 
 Run `npm-utils <command> --help` for a verb's flags.
+
+> **Breaking in 0.6**: `install`'s positional arguments are now *packages* — `npm-utils install ms=^2 lit` records and installs them, like `npm install <pkg>`.
+> The project directory moved to `--dir` (as on `add`/`remove`/`upgrade`/`init`): `npm-utils install <dir>` becomes `npm-utils install --dir <dir>`.
+> A bare `npm-utils install` still installs the current project.
+> Note that npm-utils always operates on `--dir` (default `.`) as given; it does **not** search upward for a project root the way npm's [local prefix](https://docs.npmjs.com/cli/v11/commands/npm-prefix) does.
+
+Package sources are written `name`, `name@range`, or `name=range` (e.g. `lit`, `lit@^3`, `lit=^3`) — the `=` form is never ambiguous with a path, and `./`-prefixed arguments always read as paths.
 
 `install` / `add` / `upgrade` write a `lockfileVersion`-3 `package-lock.json` that both npm and `npm-utils ci` read — every tarball pinned with its `sha512`.
 It is an npm-compatible lock for the **registry/production tree**, not a byte-for-byte npm reproduction;
@@ -159,10 +168,10 @@ each component carrying its purl, declared license, and `sha512`.
 
 ### Vulnerability checks
 
-`audit` checks a committed lock's packages against vulnerability advisories — like `npm audit`, but
+`audit` checks packages against vulnerability advisories — like `npm audit`, but
 querying **multiple sources** behind one trait. Two ship by default: npm's native registry endpoint and
 [OSV](https://osv.dev). Findings are deduped across sources (by GHSA/CVE alias) and filtered to the
-versions you actually have installed, so the npm endpoint's over-broad ranges don't cry wolf:
+versions you actually have, so the npm endpoint's over-broad ranges don't cry wolf:
 
 ```console
 $ npm-utils audit                             # query npm + OSV, group by package
@@ -176,12 +185,31 @@ lodash@4.17.11
   ...
 ```
 
+The positional source names what to audit — a project directory (its `package-lock.json`, else its
+`package.json`), an explicit manifest or lockfile path, or a registry spec:
+
+```console
+$ npm-utils audit web/                        # a project directory: lockfile preferred
+$ npm-utils audit /tmp/package.json           # an explicit package.json or package-lock.json path
+$ npm-utils audit lit=^3                      # a package and its full production dependency tree
+```
+
+A `package.json` or `name=range` source resolves its **production** dependency tree against the
+registry in memory — audit never writes a `package-lock.json` (nor needs one on disk).
+That resolution is nested like npm's: when requirements disagree (one parent wants `glob@^4`,
+another pins `5.0.15`), every resolved version is kept and audited — an audit flags issues rather
+than installs, and if the tree would contain both versions, both versions' advisories matter.
+A lockfile source audits exactly what the lock pins, dev dependencies included; prefer it when one
+exists.
+
 It mirrors npm's exit semantics: `--audit-level <low|moderate|high|critical>` sets the bar, and the
-command exits non-zero **only** when a finding at or above it exists (default `low` — any vuln fails).
-A finding is a result, not an error: it prints the report and exits `1`. An unreachable advisory
-endpoint degrades to `found 0 vulnerabilities` and exits `0` (it never fails the run); only a
-missing/unreadable lockfile is a hard error. `--format json` emits an `npm audit --json`-shaped report,
-`--sources npm,osv` selects sources, and `--registry <url>` points the npm source at a private mirror.
+command exits `1` **only** when a finding at or above it exists (default `low` — any vuln fails).
+A finding is a result, not an error: it prints the report and exits `1`. One unreachable advisory
+source degrades and the report is marked incomplete; when **every** selected source fails the audit
+exits `2` (fail closed) unless `--allow-incomplete` opts back into `0`. A missing/unreadable source
+is a hard error. `--format json` emits an `npm audit --json`-shaped report, `--sources npm,osv`
+selects sources, and `--registry <url>` points the npm advisory source *and* manifest/spec
+resolution at a private mirror.
 
 ## Examples
 
@@ -194,6 +222,9 @@ Not a general `npm`:
 npm-utils vendors **public-registry** packages and reproduces a committed `package-lock.json` — that's the remit.
 So: **no lifecycle scripts** (by design), **public registry only** (no `.npmrc`/auth), and `node_modules()` resolves a **flat, prod-only** tree that errors on a version conflict npm would nest — install from a lockfile (`from_lockfile`/`ci`) for a full tree.
 Anything unsupported — a dist-tag like `next`, `overrides`, lockfile v1 — fails with a clear error rather than silently.
+
+Two npm behaviors are deliberately absent for now (planned follow-ups):
+local directories as dependencies (`file:` specs — a directory or file source to `install`/`add` fails with a guided error), and npm's upward [local prefix](https://docs.npmjs.com/cli/v11/commands/npm-prefix) search — npm-utils always writes `node_modules/` under `--dir` (default: the working directory) exactly as given.
 
 ## License
 

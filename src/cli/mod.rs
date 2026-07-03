@@ -5,8 +5,9 @@
 //! the shared helpers they lean on (manifest read/write, the lock+install `sync` that `add` and
 //! `upgrade` both run, install reporting) live in the `common` submodule.
 //!
-//! - `install` — resolve `package.json`'s `dependencies`, write `package-lock.json`, and install
-//!   `node_modules/` (= `npm install`); `--lockfile-only` / `--no-lockfile` toggle each half.
+//! - `install` — record any given package sources (`name` / `name@range` / `name=range`) in
+//!   `package.json`, then resolve its `dependencies`, write `package-lock.json`, and install
+//!   `node_modules/` (= `npm install [pkg…]`); `--lockfile-only` / `--no-lockfile` toggle each half.
 //! - `ci` — install the exact tree a `package-lock.json` pins (= `npm ci`).
 //! - `add` — resolve package(s), record them in `package.json`, write `package-lock.json`, install.
 //! - `remove` — drop package(s) from `package.json`, refresh the lock, reinstall (= `npm remove`).
@@ -39,6 +40,7 @@ mod remove;
 mod resolve;
 mod sbom;
 mod search;
+mod source;
 mod upgrade;
 
 /// This module's ubiquitous fallible return — `()` by default, over the crate [`crate::Error`].
@@ -97,8 +99,10 @@ impl LicenseOpts {
 enum Command {
     /// Resolve dependencies, write package-lock.json, install node_modules/ (npm install)
     Install {
+        /// Packages to add first, as name, name@range, or name=range (e.g. ms, ms=^2); with no SOURCES, install the project's existing dependencies
+        sources: Vec<String>,
         /// Project directory containing package.json
-        #[arg(default_value = ".")]
+        #[arg(long, default_value = ".")]
         dir: PathBuf,
         /// Write package-lock.json but don't install node_modules/ (npm --package-lock-only, pnpm --lockfile-only)
         #[arg(
@@ -121,7 +125,7 @@ enum Command {
     },
     /// Add packages to package.json, write the lock, and install (npm add)
     Add {
-        /// Packages as name or name@range (e.g. lit, lit@^3, @lit/context@^1)
+        /// Packages as name, name@range, or name=range (e.g. lit, lit@^3, lit=^3, @lit/context@^1)
         #[arg(required = true)]
         packages: Vec<String>,
         /// Project directory
@@ -203,11 +207,11 @@ enum Command {
         #[arg(long, default_value = "auto")]
         license_source: sbom::LicenseSource,
     },
-    /// Check installed packages against vulnerability advisories (npm audit)
+    /// Check packages against vulnerability advisories (npm audit)
     Audit {
-        /// Project directory containing package-lock.json
+        /// What to audit: a project directory (its package-lock.json, else its package.json), a package.json / package-lock.json path, or a spec name=range (e.g. lit=^3) — manifests and specs resolve in memory, no lock is written
         #[arg(default_value = ".")]
-        dir: PathBuf,
+        source: String,
         /// Minimum severity that makes the command exit non-zero (default: low — any vuln fails)
         #[arg(long, value_enum, default_value = "low")]
         audit_level: audit::AuditLevel,
@@ -217,7 +221,7 @@ enum Command {
         /// Advisory sources to query, comma-separated (default: npm,osv)
         #[arg(long, value_enum, value_delimiter = ',')]
         sources: Option<Vec<audit::SourceKind>>,
-        /// Registry base URL for the npm advisory source (default: https://registry.npmjs.org)
+        /// Registry base URL for the npm advisory source and for resolving a package.json / name=range source (default: https://registry.npmjs.org)
         #[arg(long)]
         registry: Option<String>,
         /// Exit 0 even when every advisory source fails (opt into fail-open on an incomplete audit)
@@ -238,11 +242,12 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
     ));
     match cli.command {
         Command::Install {
+            sources,
             dir,
             lockfile_only,
             no_lockfile,
             license,
-        } => install::run(&dir, lockfile_only, no_lockfile, license.detail()),
+        } => install::run(&sources, &dir, lockfile_only, no_lockfile, license.detail()),
         Command::Ci { dir } => ci::run(&dir),
         Command::Add {
             packages,
@@ -270,14 +275,14 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             license_source,
         } => sbom::run(&dir, format, name.as_deref(), license_source),
         Command::Audit {
-            dir,
+            source,
             audit_level,
             format,
             sources,
             registry,
             allow_incomplete,
         } => audit::run(
-            &dir,
+            &source,
             audit_level,
             format,
             sources.as_deref(),
@@ -346,7 +351,8 @@ mod tests {
         // A smoke test that the clap grammar accepts each verb (no dispatch/network).
         for argv in [
             osv(&["npm-utils", "install"]),
-            osv(&["npm-utils", "install", "web", "--lockfile-only"]),
+            osv(&["npm-utils", "install", "--dir", "web", "--lockfile-only"]),
+            osv(&["npm-utils", "install", "ms=^2", "lit", "--dir", "/tmp/x"]),
             osv(&["npm-utils", "install", "--no-lockfile"]),
             osv(&["npm-utils", "ci", "/tmp/x"]),
             osv(&["npm-utils", "add", "lit@^3", "--dir", "/tmp/x"]),
@@ -360,6 +366,8 @@ mod tests {
             osv(&["npm-utils", "sbom", "/tmp/x", "--format", "cyclonedx"]),
             osv(&["npm-utils", "sbom", "--format", "spdx", "--name", "demo"]),
             osv(&["npm-utils", "audit", "/tmp/x"]),
+            osv(&["npm-utils", "audit", "lit=^3", "--audit-level", "high"]),
+            osv(&["npm-utils", "audit", "/tmp/x/package.json"]),
             osv(&[
                 "npm-utils",
                 "audit",
