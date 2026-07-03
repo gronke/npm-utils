@@ -169,7 +169,9 @@ impl Registry {
     /// `dependencies` are read straight from the registry metadata (no tarball
     /// extraction), every child resolved to its newest matching version, and the set
     /// de-duplicated by name. Cyclic graphs terminate (a name is resolved once).
-    /// Returns the packages sorted by name.
+    /// Returns the packages sorted by name. Packuments are prefetched concurrently
+    /// (bounded, level by level); resolution order, version selection, errors, and
+    /// output are deterministic and identical to a sequential walk.
     ///
     /// MVP limitation: a single version per package name. Two *incompatible*
     /// requirements on the same package — a genuine conflict npm would resolve by
@@ -192,6 +194,8 @@ impl Registry {
     /// This is the resolution an *audit* wants: every version the installed tree would
     /// contain is a version whose advisories matter. Installs keep
     /// [`resolve_tree`](Self::resolve_tree)'s flat one-version-per-name guarantee.
+    /// Packuments are prefetched concurrently (bounded, level by level); the result is
+    /// deterministic and identical to a sequential walk.
     pub fn resolve_tree_nested(
         &self,
         roots: &[(String, Range)],
@@ -223,7 +227,7 @@ impl Registry {
         get_packument: F,
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
-        F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+        F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
         self.resolve_walk(roots, get_packument, |_| {}, false)
     }
@@ -235,7 +239,7 @@ impl Registry {
         get_packument: F,
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
-        F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+        F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
         self.resolve_walk(roots, get_packument, |_| {}, true)
     }
@@ -247,15 +251,20 @@ impl Registry {
     /// any graph: each iteration either reuses an already-resolved satisfying version or records
     /// a `(name, version)` pair that wasn't there before, and a packument holds finitely many
     /// versions.
+    ///
+    /// The walk proceeds in rounds: each takes the whole BFS frontier, prefetches its packuments
+    /// concurrently ([`prefetch_packuments`]), and then processes the entries in their original
+    /// FIFO order — the exact sequence the one-at-a-time walk consumed, merely chunked — so
+    /// version selection, dedupe, errors, and output are identical to a sequential walk.
     fn resolve_walk<F, O>(
         &self,
         roots: &[(String, Range)],
-        mut get_packument: F,
+        get_packument: F,
         mut on_resolved: O,
         nested: bool,
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
     where
-        F: FnMut(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+        F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
         O: FnMut(usize),
     {
         use std::collections::{HashMap, VecDeque};
@@ -264,56 +273,130 @@ impl Registry {
         let mut count = 0usize;
         let mut queue: VecDeque<(String, Range)> = roots.iter().cloned().collect();
 
-        while let Some((name, range)) = queue.pop_front() {
-            if let Some(existing) = resolved.get(&name) {
-                if existing.iter().any(|r| range.matches(&r.version)) {
-                    continue; // already resolved to a satisfying version — dedup
+        while !queue.is_empty() {
+            let batch: Vec<(String, Range)> = queue.drain(..).collect();
+            prefetch_packuments(&batch, &mut packuments, &get_packument)?;
+            for (name, range) in batch {
+                if let Some(existing) = resolved.get(&name) {
+                    if existing.iter().any(|r| range.matches(&r.version)) {
+                        continue; // already resolved to a satisfying version — dedup
+                    }
+                    if !nested {
+                        return Err(format!(
+                            "version conflict for `{name}`: resolved {} but also required \
+                             `{range}` (flat node_modules install resolves one version per \
+                             package)",
+                            existing[0].version
+                        )
+                        .into());
+                    }
+                    // Nested: fall through and resolve this range's own version. The pick can't
+                    // duplicate an existing one — a satisfying existing version was handled above.
                 }
-                if !nested {
-                    return Err(format!(
-                        "version conflict for `{name}`: resolved {} but also required `{range}` \
-                         (flat node_modules install resolves one version per package)",
-                        existing[0].version
-                    )
-                    .into());
+                // The prefetch has already cached every batch name; kept as a defensive fallback.
+                if !packuments.contains_key(&name) {
+                    let doc = get_packument(&name)?;
+                    packuments.insert(name.clone(), doc);
                 }
-                // Nested: fall through and resolve this range's own version. The pick can't
-                // duplicate an existing one — a satisfying existing version was handled above.
+                let doc = &packuments[&name];
+                let (version, tarball, integrity, license) = select_version(doc, &range)
+                    .ok_or_else(|| format!("no published version of {name} matches {range}"))?;
+                let deps = dependencies_of(doc, &version);
+                let tarball_url =
+                    tarball.unwrap_or_else(|| self.tarball_url(&name, &version.to_string()));
+                for (dep_name, dep_spec) in deps {
+                    // Transitive deps routinely use npm `||`/space ranges; parse the full grammar.
+                    let dep_range = Range::parse(&dep_spec).map_err(|e| {
+                        format!(
+                            "{name}@{version} dependency `{dep_name}`: unsupported version \
+                             {dep_spec:?}: {e}"
+                        )
+                    })?;
+                    queue.push_back((dep_name, dep_range));
+                }
+                resolved.entry(name.clone()).or_default().push(Resolved {
+                    name,
+                    version,
+                    tarball_url,
+                    integrity,
+                    license,
+                });
+                count += 1;
+                on_resolved(count);
             }
-            if !packuments.contains_key(&name) {
-                let doc = get_packument(&name)?;
-                packuments.insert(name.clone(), doc);
-            }
-            let doc = &packuments[&name];
-            let (version, tarball, integrity, license) = select_version(doc, &range)
-                .ok_or_else(|| format!("no published version of {name} matches {range}"))?;
-            let deps = dependencies_of(doc, &version);
-            let tarball_url =
-                tarball.unwrap_or_else(|| self.tarball_url(&name, &version.to_string()));
-            for (dep_name, dep_spec) in deps {
-                // Transitive deps routinely use npm `||`/space ranges; parse the full grammar.
-                let dep_range = Range::parse(&dep_spec).map_err(|e| {
-                    format!(
-                        "{name}@{version} dependency `{dep_name}`: unsupported version \
-                         {dep_spec:?}: {e}"
-                    )
-                })?;
-                queue.push_back((dep_name, dep_range));
-            }
-            resolved.entry(name.clone()).or_default().push(Resolved {
-                name,
-                version,
-                tarball_url,
-                integrity,
-                license,
-            });
-            count += 1;
-            on_resolved(count);
         }
         let mut out: Vec<Resolved> = resolved.into_values().flatten().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
         Ok(out)
     }
+}
+
+/// How many packuments [`prefetch_packuments`] fetches concurrently per round. The shared
+/// agent's per-host idle pool ([`crate::download`]) is sized to match — keep the two in sync.
+const PACKUMENT_CONCURRENCY: usize = 8;
+
+/// One prefetched packument outcome (a private alias keeping the slot type readable).
+type FetchedPackument = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Fetch the packuments a round's `batch` needs — the distinct names not already in
+/// `packuments`, in first-appearance order — with up to [`PACKUMENT_CONCURRENCY`] threads, and
+/// insert them in that same order. The first failure (in batch order) aborts: deterministic,
+/// and for fetch errors identical to a one-at-a-time walk's first hit. (When a batch holds both
+/// a fetch error and an earlier entry that would fail version selection, the fetch error
+/// surfaces first — an error-path-only difference from a sequential walk.)
+///
+/// No over-fetch on success paths: a name enters the walk's `resolved` map only via the
+/// fetch-and-select path, so every resolved name is already cached and a dedupe-bound batch
+/// entry never lands in the missing set.
+fn prefetch_packuments<F>(
+    batch: &[(String, Range)],
+    packuments: &mut std::collections::HashMap<String, Value>,
+    get_packument: &F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
+{
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let missing: Vec<&str> = batch
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !packuments.contains_key(*name) && seen.insert(*name))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // One slot per missing name; workers claim indices through the atomic counter, so each slot
+    // is written exactly once. Relaxed suffices: the counter only partitions indices, and result
+    // visibility is ordered by each slot's Mutex and the scope's join.
+    let results: Vec<Mutex<Option<FetchedPackument>>> =
+        missing.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..missing.len().min(PACKUMENT_CONCURRENCY) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(name) = missing.get(i) else { break };
+                let result = get_packument(name); // fetched before the slot lock is taken
+                *results[i]
+                    .lock()
+                    .expect("no panic while holding a slot lock") = Some(result);
+            });
+        }
+    });
+
+    for (name, slot) in missing.iter().zip(results) {
+        let result = slot
+            .into_inner()
+            .expect("a panicking worker re-panics out of the scope before this runs")
+            .expect("every index below missing.len() was claimed and filled");
+        packuments.insert((*name).to_string(), result?);
+    }
+    Ok(())
 }
 
 /// The fields [`select_version`] extracts for the newest matching version:
@@ -716,6 +799,64 @@ mod tests {
             .map(|r| format!("{}@{}", r.name, r.version))
             .collect();
         assert_eq!(pairs, ["a@1.0.0", "a@2.0.0", "b@1.0.0"]);
+    }
+
+    #[test]
+    fn parallel_prefetch_is_deterministic_and_fetches_each_name_once() {
+        // Three levels, 12 distinct names — more than the 8-thread cap: root@1 → p01..p10 (^1
+        // each), each pNN@1 → shared ^1, shared@1 → {}. The per-name fetch counter lives behind
+        // a Mutex so the packument source stays `Fn + Sync` for the parallel prefetch.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        let parents: Vec<String> = (1..=10).map(|i| format!("p{i:02}")).collect();
+        pkgs.insert(
+            "root".into(),
+            packument_with(
+                "1.0.0",
+                &parents
+                    .iter()
+                    .map(|p| (p.as_str(), "^1"))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        for p in &parents {
+            pkgs.insert(p.clone(), packument_with("1.0.0", &[("shared", "^1")]));
+        }
+        pkgs.insert("shared".into(), packument_with("1.0.0", &[]));
+
+        let fetches: std::sync::Mutex<std::collections::HashMap<String, usize>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let get = |name: &str| {
+            *fetches.lock().unwrap().entry(name.to_string()).or_insert(0) += 1;
+            pkgs.get(name)
+                .cloned()
+                .ok_or_else(|| format!("no packument for {name}").into())
+        };
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap())];
+        let mut seen: Vec<usize> = Vec::new();
+        let resolved = Registry::npm()
+            .resolve_walk(&roots, get, |n| seen.push(n), true)
+            .unwrap();
+
+        // Every name fetched exactly once, despite ten same-round requirements on `shared`.
+        let fetches = fetches.into_inner().unwrap();
+        assert_eq!(fetches.len(), 12);
+        assert!(
+            fetches.values().all(|&n| n == 1),
+            "duplicate fetches: {fetches:?}"
+        );
+        // Deterministic ticks and output: 12 resolutions in FIFO order, sorted result.
+        assert_eq!(seen, (1..=12).collect::<Vec<_>>());
+        let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        let expected: Vec<String> = parents
+            .iter()
+            .cloned()
+            .chain(["root".to_string(), "shared".to_string()])
+            .collect();
+        assert_eq!(
+            names,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
     }
 
     #[test]
