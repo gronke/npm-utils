@@ -74,6 +74,26 @@ pub fn components(lock: &Lockfile) -> Vec<Component> {
     out
 }
 
+/// Registry-resolved packages (an in-memory [`crate::registry`] resolution) as bill-of-materials
+/// components — the same shape [`components`] distills from a lockfile, with no lockfile ever
+/// existing. A nested resolution may carry several versions of one name; each becomes its own
+/// component. Sorted by name, then version.
+pub fn components_from_resolved(resolved: &[crate::registry::Resolved]) -> Vec<Component> {
+    let mut out: Vec<Component> = resolved
+        .iter()
+        .map(|r| Component {
+            purl: npm_purl(&r.name, &r.version.to_string()),
+            name: r.name.clone(),
+            version: r.version.to_string(),
+            license: r.license.clone(),
+            resolved: Some(r.tarball_url.clone()),
+            integrity: r.integrity.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
+    out
+}
+
 /// Group component `name@version`s by their declared license. Components with no declared license
 /// fall under `NOASSERTION`. Keys (licenses) and values (packages) are both sorted.
 pub fn license_summary(components: &[Component]) -> BTreeMap<String, Vec<String>> {

@@ -95,6 +95,45 @@ fn init_add_ci_upgrade_roundtrip() {
 }
 
 #[test]
+#[ignore = "network: fetches ms from the npm registry"]
+fn install_with_spec_sources_records_and_installs() {
+    // `install <sources>` is npm-faithful `npm install <pkg>`: the spec is recorded in
+    // package.json, the v3 lock pins it, node_modules/ is populated — and a bare re-`install` of
+    // the same project stays clean.
+    let project = tempfile::tempdir().unwrap();
+    let dir = project.path().to_str().unwrap();
+
+    run(
+        npm_utils().args(["init", "--dir", dir, "--name", "demo"]),
+        "init",
+    );
+    run(
+        npm_utils().args(["install", "ms=^2", "--dir", dir]),
+        "install ms=^2",
+    );
+
+    let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+    assert!(
+        manifest.contains("\"ms\""),
+        "manifest records ms:\n{manifest}"
+    );
+    let lock = std::fs::read_to_string(project.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains("\"lockfileVersion\": 3"), "v3 lock:\n{lock}");
+    assert!(lock.contains("node_modules/ms"), "lock pins ms");
+    assert!(lock.contains("sha512-"), "lock carries integrity");
+    assert!(
+        project
+            .path()
+            .join("node_modules/ms/package.json")
+            .is_file(),
+        "ms downloaded, integrity-verified, extracted"
+    );
+
+    // A bare install (no sources) keeps meaning "install this project".
+    run(npm_utils().args(["install", "--dir", dir]), "bare install");
+}
+
+#[test]
 #[ignore = "network: fetches debug + ms from the npm registry"]
 fn remove_keeps_a_transitively_required_package() {
     // Regression for the release review: removing a direct dependency that is also required

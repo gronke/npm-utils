@@ -113,7 +113,10 @@ pub fn parse_dependencies(
 /// new packages to lowercase, but the registry still hosts legacy mixed-case names, and a truly
 /// invalid name simply 404s — enforcing case here would only reject valid installs. Anything
 /// outside the allowlist is a typo or a crafted entry meant to traverse a path later — fail loudly.
-fn validate_package_name(name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// `pub(crate)` so the CLI's source grammar screens spec names through the same allowlist.
+pub(crate) fn validate_package_name(
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if name.is_empty() || name.len() > 200 {
         return Err(format!("package name {name:?} has invalid length").into());
     }

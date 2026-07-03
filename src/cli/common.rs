@@ -7,11 +7,38 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::source::{BareToken, Source};
 use super::Res;
-use crate::registry::{PackumentDetail, Resolved};
+use crate::package_json::{manifest, spec};
+use crate::registry::{PackumentDetail, Registry, Resolved};
 
 // Manifest read/write moved to `crate::project` (public API); re-export for the verb submodules.
 pub(super) use crate::project::{read_manifest, write_manifest};
+
+/// Parse `tokens` as registry spec sources (`name`, `name@range`, `name=range` — a directory/file
+/// source gets a clear error naming `verb`), resolve a missing range to `^latest`, record each in
+/// `package.json` (scaffolding one if absent), and write the manifest back. Returns the updated
+/// doc; `add` and `install <SOURCES>` share it.
+pub(super) fn add_specs(tokens: &[String], dir: &Path, verb: &str) -> Res<Value> {
+    let mut doc = if dir.join("package.json").exists() {
+        read_manifest(dir)?
+    } else {
+        manifest::scaffold(&default_name(dir), "1.0.0")
+    };
+
+    let registry = Registry::npm();
+    for token in tokens {
+        let (name, range) = Source::parse(token, BareToken::Spec)?.into_spec(verb)?;
+        let range = match range {
+            Some(r) => r,
+            None => format!("^{}", registry.resolve(&name, &spec::Range::any())?.version),
+        };
+        manifest::upsert_dependency(&mut doc, &name, &range);
+        println!("+ {name}@{range}");
+    }
+    write_manifest(dir, &doc)?;
+    Ok(doc)
+}
 
 /// Rewrite the lock from the manifest and install, then print the installed tree. The library
 /// [`crate::project::sync`] does the work and returns the packages; this thin wrapper reports them
