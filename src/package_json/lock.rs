@@ -13,7 +13,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use super::{manifest, spec};
-use crate::registry::Registry;
+use crate::registry::{Omission, Registry};
 
 /// A parsed `package-lock.json`.
 #[derive(Debug, Clone)]
@@ -226,7 +226,8 @@ pub fn render_v3_from_manifest(
 
 /// A manifest's **registry** `dependencies` as resolvable roots — entries whose spec is a
 /// registry range (git / `file:` / tarball specs are skipped), each parsed by the npm range
-/// grammar. Shared by [`render_v3_from_manifest`] and the CLI audit's in-memory resolution.
+/// grammar. The lockfile writer's root extraction; the audit uses [`audit_roots`], which skips
+/// nothing silently.
 pub(crate) fn registry_roots(
     doc: &Value,
 ) -> Result<Vec<(String, spec::Range)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -235,6 +236,64 @@ pub(crate) fn registry_roots(
         .filter(|(_, range)| spec::Spec::parse(range).is_registry())
         .map(|(name, range)| Ok((name.clone(), spec::Range::parse(range)?)))
         .collect()
+}
+
+/// A manifest's dependency roots for an **audit**: `dependencies` merged with
+/// `optionalDependencies` (an optional entry overrides a same-name regular one, as npm applies
+/// them), each classified by [`crate::registry::classify_dep`] — registry ranges and `npm:`
+/// aliases to them become `(name, range, optional)` roots, non-registry specs become
+/// [`Omission`]s with their verbatim spec text, and a manifest declaring `workspaces` records
+/// one omission (workspace packages are not traversed). A malformed range is a hard error
+/// naming the dependency.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn audit_roots(
+    doc: &Value,
+) -> Result<AuditRoots, Box<dyn std::error::Error + Send + Sync>> {
+    let mut merged: Vec<(String, String, bool)> = manifest::dependencies(doc)
+        .into_iter()
+        .map(|(name, spec_text)| (name, spec_text, false))
+        .collect();
+    for (name, spec_text) in manifest::optional_dependencies(doc) {
+        match merged.iter_mut().find(|(existing, ..)| *existing == name) {
+            Some(entry) => *entry = (name, spec_text, true),
+            None => merged.push((name, spec_text, true)),
+        }
+    }
+
+    let mut roots = Vec::new();
+    let mut omissions = Vec::new();
+    for (name, spec_text, optional) in merged {
+        let action = crate::registry::classify_dep(&name, &spec_text)
+            .map_err(|e| format!("package.json dependency `{name}`: {e}"))?;
+        match action {
+            crate::registry::EdgeAction::Resolve { name, range } => {
+                roots.push((name, range, optional))
+            }
+            crate::registry::EdgeAction::Omit(omission) => omissions.push(omission),
+        }
+    }
+    if has_workspaces(doc) {
+        omissions.push(Omission::new("workspaces", "", "not traversed"));
+    }
+    Ok((roots, omissions))
+}
+
+/// [`audit_roots`]'s result: the resolvable `(name, range, optional)` roots and the manifest
+/// entries the audit cannot follow.
+pub(crate) type AuditRoots = (Vec<(String, spec::Range, bool)>, Vec<Omission>);
+
+/// Whether the manifest declares any workspaces — the array form or the object form's
+/// `packages` list.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+fn has_workspaces(doc: &Value) -> bool {
+    match doc.get("workspaces") {
+        Some(Value::Array(list)) => !list.is_empty(),
+        Some(Value::Object(map)) => map
+            .get("packages")
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty()),
+        _ => false,
+    }
 }
 
 /// Read a `package.json`-shaped manifest and (re)write its `package-lock.json` from the
@@ -551,5 +610,80 @@ mod tests {
             ms.is_registry_tarball(),
             "resolved is an https registry tarball"
         );
+    }
+
+    #[test]
+    fn audit_roots_merges_optional_over_regular_and_flags_it() {
+        let doc = serde_json::json!({
+            "dependencies": { "a": "^1", "x": "^1" },
+            "optionalDependencies": { "x": "^2", "opt": "^3" }
+        });
+        let (roots, omissions) = audit_roots(&doc).unwrap();
+        let flat: Vec<(String, String, bool)> = roots
+            .into_iter()
+            .map(|(n, r, o)| (n, r.to_string(), o))
+            .collect();
+        assert_eq!(
+            flat,
+            [
+                ("a".to_string(), "^1".to_string(), false),
+                ("x".to_string(), "^2".to_string(), true),
+                ("opt".to_string(), "^3".to_string(), true),
+            ],
+            "the optional entry overrides the regular one in place, flag flipped"
+        );
+        assert!(omissions.is_empty());
+    }
+
+    #[test]
+    fn audit_roots_records_non_registry_specs_and_workspaces_as_omissions() {
+        let doc = serde_json::json!({
+            "dependencies": {
+                "g": "git+ssh://git@github.com/x/y.git",
+                "local": "file:../local",
+                "w": "workspace:*",
+                "keep": "^1"
+            },
+            "workspaces": ["packages/*"]
+        });
+        let (roots, omissions) = audit_roots(&doc).unwrap();
+        assert_eq!(roots.len(), 1, "only the registry dep resolves");
+        assert_eq!(roots[0].0, "keep");
+        let rendered: Vec<String> = omissions.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            [
+                "g (git+ssh://git@github.com/x/y.git: git dependency)",
+                "local (file:../local: local path)",
+                "w (workspace:*: workspace: protocol)",
+                "workspaces (not traversed)",
+            ],
+            "verbatim spec text, and workspace:* no longer aborts the audit"
+        );
+    }
+
+    #[test]
+    fn audit_roots_resolves_an_alias_target_and_rejects_garbage() {
+        let doc = serde_json::json!({ "dependencies": { "aliased": "npm:real@^2" } });
+        let (roots, omissions) = audit_roots(&doc).unwrap();
+        assert_eq!(roots[0].0, "real", "the alias target is what gets audited");
+        assert!(omissions.is_empty());
+
+        let doc = serde_json::json!({ "dependencies": { "bad": "%% nope %%" } });
+        let err = audit_roots(&doc).unwrap_err().to_string();
+        assert!(
+            err.contains("package.json dependency `bad`"),
+            "malformed ranges stay hard errors naming the dependency: {err}"
+        );
+    }
+
+    #[test]
+    fn has_workspaces_reads_both_declaration_forms() {
+        assert!(has_workspaces(&serde_json::json!({ "workspaces": ["a"] })));
+        assert!(has_workspaces(
+            &serde_json::json!({ "workspaces": { "packages": ["a"] } })
+        ));
+        assert!(!has_workspaces(&serde_json::json!({ "workspaces": [] })));
+        assert!(!has_workspaces(&serde_json::json!({ "name": "x" })));
     }
 }

@@ -229,7 +229,7 @@ enum Command {
         /// Registry base URL for the npm advisory source and for resolving a package.json / name=range source (default: https://registry.npmjs.org)
         #[arg(long)]
         registry: Option<String>,
-        /// Exit 0 even when every advisory source fails (opt into fail-open on an incomplete audit)
+        /// Exit 0 even when the audit is incomplete — every advisory source failed, or some dependencies could not be audited (opt into fail-open)
         #[arg(long)]
         allow_incomplete: bool,
     },

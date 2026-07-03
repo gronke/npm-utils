@@ -2,7 +2,7 @@
 //! resolution against a semver range.
 
 use crate::download;
-use crate::package_json::spec::Range;
+use crate::package_json::spec::{Range, Spec};
 use semver::Version;
 use serde_json::Value;
 
@@ -64,6 +64,48 @@ pub struct Resolved {
     /// `None` when the packument declares none. Carried so a generated lockfile can record
     /// it for license/compliance tooling (npm's own lockfiles do the same).
     pub license: Option<String>,
+}
+
+/// A dependency the audit resolution *skipped* rather than resolved — a non-registry spec
+/// (git / path / tarball / `workspace:` / `link:` / alias to one of those) or an optional
+/// dependency that failed to resolve — so an audit can report what it did **not** check.
+///
+/// `#[non_exhaustive]` like [`Resolved`]: constructed only inside the crate, read by callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Omission {
+    pub name: String,
+    /// The spec/range text that couldn't be followed — verbatim for a manifest root; a parsed
+    /// range's display form for a transitive edge (the verbatim text is gone after parsing);
+    /// empty when no spec applies (e.g. the `workspaces` marker).
+    pub spec: String,
+    /// Prose for reports: e.g. `git dependency`, `local path`, `remote tarball`,
+    /// `workspace: protocol`, `optional dependency failed to fetch: <cause>`.
+    pub reason: String,
+}
+
+impl Omission {
+    pub(crate) fn new(
+        name: impl Into<String>,
+        spec: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Omission {
+        Omission {
+            name: name.into(),
+            spec: spec.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Omission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.spec.is_empty() {
+            write!(f, "{} ({})", self.name, self.reason)
+        } else {
+            write!(f, "{} ({}: {})", self.name, self.spec, self.reason)
+        }
+    }
 }
 
 /// A single npm registry search result (from the `/-/v1/search` endpoint): the package name, its
@@ -191,8 +233,13 @@ impl Registry {
     /// instead of erroring like [`resolve_tree`](Self::resolve_tree). Returns the packages
     /// sorted by name, then version — possibly several versions of one name.
     ///
-    /// This is the resolution an *audit* wants: every version the installed tree would
-    /// contain is a version whose advisories matter. Installs keep
+    /// This is the resolution an *audit* wants — a nested-compatible package/version set, **not**
+    /// npm's placement algorithm: no hoisting, no peer-dependency handling, and no os/cpu
+    /// filtering (every platform's optional deps are included — their advisories matter
+    /// regardless of the auditing machine). `optionalDependencies` are traversed alongside
+    /// `dependencies`; non-registry specs (git / path / tarball / `workspace:` / `link:`) and
+    /// optional deps that fail to resolve are skipped — this method drops the [`Omission`]
+    /// records, the crate-internal observed variant returns them. Installs keep
     /// [`resolve_tree`](Self::resolve_tree)'s flat one-version-per-name guarantee.
     /// Packuments are prefetched concurrently (bounded, level by level); the result is
     /// deterministic and identical to a sequential walk.
@@ -200,23 +247,32 @@ impl Registry {
         &self,
         roots: &[(String, Range)],
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
-        self.resolve_tree_nested_observed(roots, |_, _| {})
+        self.resolve_tree_nested_observed(&required_roots(roots), |_, _| {})
+            .map(|(packages, _omissions)| packages)
     }
 
-    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with a per-package progress observer:
-    /// `on_resolved` is called once per resolved package version, with the running total so far
-    /// and the package just resolved — the CLI's `audit` verb drives a live stderr line from it.
-    /// Resolution behavior (walk order, nested semantics, errors, sorting) is identical;
-    /// [`resolve_tree_nested`](Self::resolve_tree_nested) is this with a no-op observer.
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with a per-package progress observer
+    /// and the skipped dependencies reported: `on_resolved` is called once per resolved package
+    /// version, with the running total so far and the package just resolved — the CLI's `audit`
+    /// verb drives a live stderr line from it. Roots carry an `optional` flag (an
+    /// `optionalDependencies` root may fail to resolve without failing the walk). Resolution
+    /// behavior (walk order, nested semantics, errors, sorting) is identical to
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested), which is this with a no-op observer,
+    /// required roots, and the omissions dropped.
     pub(crate) fn resolve_tree_nested_observed<O>(
         &self,
-        roots: &[(String, Range)],
+        roots: &[(String, Range, bool)],
         on_resolved: O,
-    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<(Vec<Resolved>, Vec<Omission>), Box<dyn std::error::Error + Send + Sync>>
     where
         O: FnMut(usize, &Resolved),
     {
-        self.resolve_walk(roots, |name| self.packument(name), on_resolved, true)
+        self.resolve_walk(
+            roots,
+            |name| self.packument(name),
+            on_resolved,
+            NESTED_AUDIT,
+        )
     }
 
     /// [`resolve_tree`](Self::resolve_tree) with an injectable packument source, so the
@@ -229,13 +285,20 @@ impl Registry {
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
-        self.resolve_walk(roots, get_packument, |_, _| {}, false)
+        self.resolve_walk(
+            &required_roots(roots),
+            get_packument,
+            |_, _| {},
+            FLAT_INSTALL,
+        )
+        .map(|(packages, _omissions)| packages)
     }
 
     /// [`resolve_tree_nested`](Self::resolve_tree_nested) with an injectable packument source —
     /// a test-only seam ([`resolve_tree_nested`] itself routes through
     /// [`resolve_tree_nested_observed`](Self::resolve_tree_nested_observed), so nothing outside
-    /// the tests calls this).
+    /// the tests calls this). Passes the same [`NESTED_AUDIT`] policy as the public method, so
+    /// offline tests exercise the real audit walk.
     #[cfg(test)]
     fn resolve_tree_nested_from<F>(
         &self,
@@ -245,47 +308,64 @@ impl Registry {
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
-        self.resolve_walk(roots, get_packument, |_, _| {}, true)
+        self.resolve_walk(
+            &required_roots(roots),
+            get_packument,
+            |_, _| {},
+            NESTED_AUDIT,
+        )
+        .map(|(packages, _omissions)| packages)
     }
 
-    /// The shared graph walk. `nested: false` errors on a version conflict (one version per
-    /// name — an installable flat tree); `nested: true` resolves the conflicting range to its
-    /// own version instead, as npm would by nesting a second copy. `on_resolved` sees the
-    /// running count and the package after each resolution (a deduped requirement does not
-    /// tick). Terminates on any graph: each iteration either reuses an already-resolved
-    /// satisfying version or records a `(name, version)` pair that wasn't there before, and a
-    /// packument holds finitely many versions.
+    /// The shared graph walk. `policy.nested: false` errors on a version conflict (one version
+    /// per name — an installable flat tree); `true` resolves the conflicting range to its own
+    /// version instead, as npm would by nesting a second copy. Under the audit policy the walk
+    /// also traverses `optionalDependencies` and records what it cannot follow as [`Omission`]s
+    /// — non-registry specs, and optional edges whose fetch or version selection fails — where
+    /// the install policy keeps every failure fatal. `on_resolved` sees the running count and
+    /// the package after each resolution (a deduped requirement does not tick). Terminates on
+    /// any graph: each iteration either reuses an already-resolved satisfying version, records
+    /// a `(name, version)` pair that wasn't there before, or skips.
     ///
     /// The walk proceeds in rounds: each takes the whole BFS frontier, prefetches its packuments
     /// concurrently ([`prefetch_packuments`]), and then processes the entries in their original
     /// FIFO order — the exact sequence the one-at-a-time walk consumed, merely chunked — so
-    /// version selection, dedupe, errors, and output are identical to a sequential walk.
+    /// version selection, dedupe, errors, omissions, and output are identical to a sequential
+    /// walk.
     fn resolve_walk<F, O>(
         &self,
-        roots: &[(String, Range)],
+        roots: &[(String, Range, bool)],
         get_packument: F,
         mut on_resolved: O,
-        nested: bool,
-    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
+        policy: WalkPolicy,
+    ) -> Result<(Vec<Resolved>, Vec<Omission>), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
         O: FnMut(usize, &Resolved),
     {
         use std::collections::{HashMap, VecDeque};
         let mut packuments: HashMap<String, Value> = HashMap::new();
+        let mut fetch_errors: HashMap<String, String> = HashMap::new();
         let mut resolved: HashMap<String, Vec<Resolved>> = HashMap::new();
+        let mut omissions: Vec<Omission> = Vec::new();
         let mut count = 0usize;
-        let mut queue: VecDeque<(String, Range)> = roots.iter().cloned().collect();
+        let mut queue: VecDeque<(String, Range, bool)> = roots.iter().cloned().collect();
 
         while !queue.is_empty() {
-            let batch: Vec<(String, Range)> = queue.drain(..).collect();
-            prefetch_packuments(&batch, &mut packuments, &get_packument)?;
-            for (name, range) in batch {
+            let batch: Vec<(String, Range, bool)> = queue.drain(..).collect();
+            prefetch_packuments(
+                &batch,
+                &mut packuments,
+                &mut fetch_errors,
+                !policy.skip_unsupported,
+                &get_packument,
+            )?;
+            for (name, range, optional) in batch {
                 if let Some(existing) = resolved.get(&name) {
                     if existing.iter().any(|r| range.matches(&r.version)) {
                         continue; // already resolved to a satisfying version — dedup
                     }
-                    if !nested {
+                    if !policy.nested {
                         return Err(format!(
                             "version conflict for `{name}`: resolved {} but also required \
                              `{range}` (flat node_modules install resolves one version per \
@@ -297,26 +377,76 @@ impl Registry {
                     // Nested: fall through and resolve this range's own version. The pick can't
                     // duplicate an existing one — a satisfying existing version was handled above.
                 }
+                // A name whose prefetch failed: fatal on a required edge, an omission on an
+                // optional one — npm likewise tolerates an optional dep that fails to resolve.
+                if let Some(cause) = fetch_errors.get(&name) {
+                    if policy.skip_unsupported && optional {
+                        push_unique(
+                            &mut omissions,
+                            Omission::new(
+                                &name,
+                                range.to_string(),
+                                format!("optional dependency failed to fetch: {cause}"),
+                            ),
+                        );
+                        continue;
+                    }
+                    return Err(cause.clone().into());
+                }
                 // The prefetch has already cached every batch name; kept as a defensive fallback.
                 if !packuments.contains_key(&name) {
                     let doc = get_packument(&name)?;
                     packuments.insert(name.clone(), doc);
                 }
                 let doc = &packuments[&name];
-                let (version, tarball, integrity, license) = select_version(doc, &range)
-                    .ok_or_else(|| format!("no published version of {name} matches {range}"))?;
-                let deps = dependencies_of(doc, &version);
+                let (version, tarball, integrity, license) = match select_version(doc, &range) {
+                    Some(selected) => selected,
+                    None if policy.skip_unsupported && optional => {
+                        push_unique(
+                            &mut omissions,
+                            Omission::new(
+                                &name,
+                                range.to_string(),
+                                "optional dependency: no published version matches",
+                            ),
+                        );
+                        continue;
+                    }
+                    None => {
+                        return Err(format!("no published version of {name} matches {range}").into())
+                    }
+                };
+                let deps = dependencies_of(doc, &version, policy.include_optional);
                 let tarball_url =
                     tarball.unwrap_or_else(|| self.tarball_url(&name, &version.to_string()));
-                for (dep_name, dep_spec) in deps {
-                    // Transitive deps routinely use npm `||`/space ranges; parse the full grammar.
-                    let dep_range = Range::parse(&dep_spec).map_err(|e| {
-                        format!(
-                            "{name}@{version} dependency `{dep_name}`: unsupported version \
-                             {dep_spec:?}: {e}"
-                        )
-                    })?;
-                    queue.push_back((dep_name, dep_range));
+                for (dep_name, dep_spec, dep_optional) in deps {
+                    if policy.skip_unsupported {
+                        // Non-registry child specs become omissions; a child of an optional
+                        // package is itself optional (npm skips the whole optional subtree).
+                        let action = classify_dep(&dep_name, &dep_spec).map_err(|e| {
+                            format!(
+                                "{name}@{version} dependency `{dep_name}`: unsupported version \
+                                 {dep_spec:?}: {e}"
+                            )
+                        })?;
+                        match action {
+                            EdgeAction::Resolve {
+                                name: target,
+                                range: dep_range,
+                            } => queue.push_back((target, dep_range, optional || dep_optional)),
+                            EdgeAction::Omit(omission) => push_unique(&mut omissions, omission),
+                        }
+                    } else {
+                        // Transitive deps routinely use npm `||`/space ranges; parse the full
+                        // grammar.
+                        let dep_range = Range::parse(&dep_spec).map_err(|e| {
+                            format!(
+                                "{name}@{version} dependency `{dep_name}`: unsupported version \
+                                 {dep_spec:?}: {e}"
+                            )
+                        })?;
+                        queue.push_back((dep_name, dep_range, false));
+                    }
                 }
                 let package = Resolved {
                     name,
@@ -335,7 +465,116 @@ impl Registry {
         }
         let mut out: Vec<Resolved> = resolved.into_values().flatten().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
-        Ok(out)
+        omissions.sort_by(|a, b| (&a.name, &a.spec).cmp(&(&b.name, &b.spec)));
+        Ok((out, omissions))
+    }
+}
+
+/// What the graph walk does with the dependency classes an install can't or shouldn't follow;
+/// see [`FLAT_INSTALL`] and [`NESTED_AUDIT`].
+#[derive(Clone, Copy)]
+struct WalkPolicy {
+    /// Keep one version per disagreeing range (npm's nesting) instead of erroring on a conflict.
+    nested: bool,
+    /// Traverse `optionalDependencies` alongside `dependencies`.
+    include_optional: bool,
+    /// Record non-registry specs and failed optional edges as [`Omission`]s instead of aborting.
+    skip_unsupported: bool,
+}
+
+/// The install walk: flat, `dependencies` only, every failure aborts.
+const FLAT_INSTALL: WalkPolicy = WalkPolicy {
+    nested: false,
+    include_optional: false,
+    skip_unsupported: false,
+};
+
+/// The audit walk: nested, optional deps included, unauditable edges recorded as omissions.
+const NESTED_AUDIT: WalkPolicy = WalkPolicy {
+    nested: true,
+    include_optional: true,
+    skip_unsupported: true,
+};
+
+/// Adapt plain `(name, range)` roots to required (non-optional) walk edges.
+fn required_roots(roots: &[(String, Range)]) -> Vec<(String, Range, bool)> {
+    roots
+        .iter()
+        .map(|(name, range)| (name.clone(), range.clone(), false))
+        .collect()
+}
+
+/// Record `omission` unless an identical one (same name, spec, reason) is already recorded —
+/// the same unsupported dep reached from several parents reports once.
+fn push_unique(omissions: &mut Vec<Omission>, omission: Omission) {
+    if !omissions.contains(&omission) {
+        omissions.push(omission);
+    }
+}
+
+/// One classified dependency edge under the audit policy ([`classify_dep`]).
+pub(crate) enum EdgeAction {
+    /// A registry-resolvable edge — for an `npm:` alias, `name` is the alias **target**.
+    Resolve { name: String, range: Range },
+    /// An edge the audit resolution cannot follow, recorded rather than resolved.
+    Omit(Omission),
+}
+
+/// Classify one dependency edge for the audit walk: registry ranges (and `npm:` aliases to
+/// registry ranges) resolve; git / path / tarball / `workspace:` / `link:` specs — and aliases
+/// to them — are omissions. A malformed registry range is a hard error (fail clearly), never an
+/// omission. The `workspace:`/`link:` prefixes are checked before [`Spec::parse`], which has no
+/// variants for them (`link:../x` would misread as a git shorthand).
+pub(crate) fn classify_dep(
+    name: &str,
+    spec: &str,
+) -> Result<EdgeAction, Box<dyn std::error::Error + Send + Sync>> {
+    let spec = spec.trim();
+    if spec.starts_with("workspace:") {
+        return Ok(EdgeAction::Omit(Omission::new(
+            name,
+            spec,
+            "workspace: protocol",
+        )));
+    }
+    if spec.starts_with("link:") {
+        return Ok(EdgeAction::Omit(Omission::new(
+            name,
+            spec,
+            "link: protocol",
+        )));
+    }
+    match Spec::parse(spec) {
+        Spec::Git { .. } => Ok(EdgeAction::Omit(Omission::new(
+            name,
+            spec,
+            "git dependency",
+        ))),
+        Spec::Tarball(_) => Ok(EdgeAction::Omit(Omission::new(
+            name,
+            spec,
+            "remote tarball",
+        ))),
+        Spec::Path(_) => Ok(EdgeAction::Omit(Omission::new(name, spec, "local path"))),
+        Spec::Alias {
+            name: target,
+            spec: inner,
+        } => match *inner {
+            // The alias target is what gets installed — resolve and audit it.
+            Spec::Registry(range) => Ok(EdgeAction::Resolve {
+                name: target,
+                range: Range::parse(&range)?,
+            }),
+            _ => Ok(EdgeAction::Omit(Omission::new(
+                name,
+                spec,
+                "npm: alias to a non-registry target",
+            ))),
+        },
+        Spec::Registry(range) => Ok(EdgeAction::Resolve {
+            name: name.to_string(),
+            range: Range::parse(&range)?,
+        }),
     }
 }
 
@@ -347,18 +586,24 @@ const PACKUMENT_CONCURRENCY: usize = 8;
 type FetchedPackument = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Fetch the packuments a round's `batch` needs — the distinct names not already in
-/// `packuments`, in first-appearance order — with up to [`PACKUMENT_CONCURRENCY`] threads, and
-/// insert them in that same order. The first failure (in batch order) aborts: deterministic,
-/// and for fetch errors identical to a one-at-a-time walk's first hit. (When a batch holds both
-/// a fetch error and an earlier entry that would fail version selection, the fetch error
-/// surfaces first — an error-path-only difference from a sequential walk.)
+/// `packuments` (nor already recorded as failed), in first-appearance order — with up to
+/// [`PACKUMENT_CONCURRENCY`] threads, and insert them in that same order.
+///
+/// Failure handling follows the walk policy. `fail_fast` (the install walk): the first failure
+/// in batch order aborts with the original error — exactly the sequential walk's first hit.
+/// Otherwise (the audit walk) every failure is recorded in `fetch_errors` and the walk decides
+/// per entry: fatal for a required edge, an [`Omission`] for an optional one. A failed name is
+/// never re-fetched — later rounds see it in `fetch_errors` and skip it in the missing set — so
+/// every name is fetched exactly once regardless of outcome.
 ///
 /// No over-fetch on success paths: a name enters the walk's `resolved` map only via the
 /// fetch-and-select path, so every resolved name is already cached and a dedupe-bound batch
 /// entry never lands in the missing set.
 fn prefetch_packuments<F>(
-    batch: &[(String, Range)],
+    batch: &[(String, Range, bool)],
     packuments: &mut std::collections::HashMap<String, Value>,
+    fetch_errors: &mut std::collections::HashMap<String, String>,
+    fail_fast: bool,
     get_packument: &F,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -371,8 +616,12 @@ where
     let mut seen: HashSet<&str> = HashSet::new();
     let missing: Vec<&str> = batch
         .iter()
-        .map(|(name, _)| name.as_str())
-        .filter(|name| !packuments.contains_key(*name) && seen.insert(*name))
+        .map(|(name, _, _)| name.as_str())
+        .filter(|name| {
+            !packuments.contains_key(*name)
+                && !fetch_errors.contains_key(*name)
+                && seen.insert(*name)
+        })
         .collect();
     if missing.is_empty() {
         return Ok(());
@@ -402,7 +651,15 @@ where
             .into_inner()
             .expect("a panicking worker re-panics out of the scope before this runs")
             .expect("every index below missing.len() was claimed and filled");
-        packuments.insert((*name).to_string(), result?);
+        match result {
+            Ok(doc) => {
+                packuments.insert((*name).to_string(), doc);
+            }
+            Err(e) if fail_fast => return Err(e),
+            Err(e) => {
+                fetch_errors.insert((*name).to_string(), e.to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -455,20 +712,41 @@ fn license_of(meta: &Value) -> Option<String> {
 /// (the package-spec grammar); re-exported here for back-compat as `registry::version_req`.
 pub use crate::package_json::spec::version_req;
 
-/// The `dependencies` of a specific version, read from a packument, as `(name, spec)`
-/// pairs. The full packument carries each version's `dependencies` inline, so the
-/// transitive walk discovers children without extracting any tarball.
-fn dependencies_of(doc: &Value, version: &Version) -> Vec<(String, String)> {
-    doc.get("versions")
-        .and_then(|v| v.get(version.to_string()))
-        .and_then(|meta| meta.get("dependencies"))
-        .and_then(|d| d.as_object())
-        .map(|map| {
-            map.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
+/// The `dependencies` — and, when `include_optional`, the `optionalDependencies` — of a
+/// specific version, read from a packument, as `(name, spec, optional)` triples. Both maps ride
+/// inline in each version's metadata (the abbreviated install packument included), so the
+/// transitive walk discovers children without extracting any tarball. An `optionalDependencies`
+/// entry overrides a same-name `dependencies` entry **in place** (npm applies optional entries
+/// over regular ones), keeping one triple per name in a deterministic order.
+fn dependencies_of(
+    doc: &Value,
+    version: &Version,
+    include_optional: bool,
+) -> Vec<(String, String, bool)> {
+    let meta = doc.get("versions").and_then(|v| v.get(version.to_string()));
+    let read = |key: &str| -> Vec<(String, String)> {
+        meta.and_then(|m| m.get(key))
+            .and_then(|d| d.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out: Vec<(String, String, bool)> = read("dependencies")
+        .into_iter()
+        .map(|(name, spec)| (name, spec, false))
+        .collect();
+    if include_optional {
+        for (name, spec) in read("optionalDependencies") {
+            match out.iter_mut().find(|(existing, ..)| *existing == name) {
+                Some(entry) => *entry = (name, spec, true),
+                None => out.push((name, spec, true)),
+            }
+        }
+    }
+    out
 }
 
 /// Parse the registry's `/-/v1/search` response into [`SearchResult`]s, skipping any malformed
@@ -809,6 +1087,375 @@ mod tests {
         assert_eq!(pairs, ["a@1.0.0", "a@2.0.0", "b@1.0.0"]);
     }
 
+    /// [`packument_with`], plus an `optionalDependencies` map.
+    fn packument_with_optional(
+        version: &str,
+        deps: &[(&str, &str)],
+        optional: &[(&str, &str)],
+    ) -> Value {
+        let mut doc = packument_with(version, deps);
+        let opt_map: serde_json::Map<String, Value> = optional
+            .iter()
+            .map(|(n, s)| (n.to_string(), json!(*s)))
+            .collect();
+        doc["versions"][version]["optionalDependencies"] = Value::Object(opt_map);
+        doc
+    }
+
+    /// A `HashMap`-backed packument source for the walk tests.
+    fn source_from(
+        pkgs: &std::collections::HashMap<String, Value>,
+    ) -> impl Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync + '_ {
+        |name| {
+            pkgs.get(name)
+                .cloned()
+                .ok_or_else(|| format!("no packument for {name}").into())
+        }
+    }
+
+    fn pairs(resolved: &[Resolved]) -> Vec<String> {
+        resolved
+            .iter()
+            .map(|r| format!("{}@{}", r.name, r.version))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_tree_nested_terminates_on_a_mutual_cycle() {
+        // a@1 ↔ b@1 require each other with satisfiable ranges: dedupe breaks the cycle.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert("a".into(), packument_with("1.0.0", &[("b", "^1")]));
+        pkgs.insert("b".into(), packument_with("1.0.0", &[("a", "^1")]));
+
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let resolved = Registry::npm()
+            .resolve_tree_nested_from(&roots, source_from(&pkgs))
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["a@1.0.0", "b@1.0.0"]);
+    }
+
+    #[test]
+    fn resolve_tree_nested_reuses_a_satisfying_version_across_parents() {
+        // The plain diamond under the nested policy: a → {b, c}, b → c — c resolves once.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "a".into(),
+            packument_with("1.0.0", &[("b", "^1"), ("c", "^1")]),
+        );
+        pkgs.insert("b".into(), packument_with("1.2.0", &[("c", "^1")]));
+        pkgs.insert("c".into(), packument_with("1.5.0", &[]));
+
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let resolved = Registry::npm()
+            .resolve_tree_nested_from(&roots, source_from(&pkgs))
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["a@1.0.0", "b@1.2.0", "c@1.5.0"]);
+    }
+
+    #[test]
+    fn optional_dependencies_traverse_nested_and_stay_ignored_flat() {
+        // root has no regular deps and one optional dep; opt@1 pulls a regular child of its own,
+        // which inherits the optional flag transitively.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "root".into(),
+            packument_with_optional("1.0.0", &[], &[("opt", "^1")]),
+        );
+        pkgs.insert("opt".into(), packument_with("1.1.0", &[("leaf", "^1")]));
+        pkgs.insert("leaf".into(), packument_with("1.0.0", &[]));
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap())];
+        let resolved = Registry::npm()
+            .resolve_tree_nested_from(&roots, source_from(&pkgs))
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["leaf@1.0.0", "opt@1.1.0", "root@1.0.0"]);
+
+        // The flat install walk ignores optionalDependencies entirely (unchanged behavior).
+        let resolved = Registry::npm()
+            .resolve_tree_from(&roots, source_from(&pkgs))
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["root@1.0.0"]);
+    }
+
+    #[test]
+    fn dependencies_of_lets_an_optional_entry_override_in_place() {
+        let doc = packument_with_optional("1.0.0", &[("x", "^1"), ("y", "^1")], &[("x", "^2")]);
+        let version = Version::parse("1.0.0").unwrap();
+        assert_eq!(
+            dependencies_of(&doc, &version, true),
+            [
+                ("x".to_string(), "^2".to_string(), true),
+                ("y".to_string(), "^1".to_string(), false),
+            ],
+            "the optional entry replaces the regular one in place, flag flipped"
+        );
+        assert_eq!(
+            dependencies_of(&doc, &version, false),
+            [
+                ("x".to_string(), "^1".to_string(), false),
+                ("y".to_string(), "^1".to_string(), false),
+            ],
+            "the install walk never sees optionalDependencies"
+        );
+    }
+
+    #[test]
+    fn optional_fetch_failure_is_an_omission_and_siblings_still_resolve() {
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "root".into(),
+            packument_with_optional("1.0.0", &[("b", "^1")], &[("gone", "^2")]),
+        );
+        pkgs.insert("b".into(), packument_with("1.0.0", &[]));
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
+        let (resolved, omissions) = Registry::npm()
+            .resolve_walk(&roots, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["b@1.0.0", "root@1.0.0"]);
+        assert_eq!(omissions.len(), 1, "{omissions:?}");
+        assert_eq!(omissions[0].name, "gone");
+        assert!(
+            omissions[0]
+                .reason
+                .contains("optional dependency failed to fetch"),
+            "{}",
+            omissions[0]
+        );
+    }
+
+    #[test]
+    fn optional_version_mismatch_is_an_omission() {
+        // `opt` exists but publishes no version matching the optional range.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "root".into(),
+            packument_with_optional("1.0.0", &[], &[("opt", "^9")]),
+        );
+        pkgs.insert("opt".into(), packument_with("1.0.0", &[]));
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
+        let (resolved, omissions) = Registry::npm()
+            .resolve_walk(&roots, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["root@1.0.0"]);
+        assert_eq!(omissions.len(), 1);
+        assert!(
+            omissions[0].reason.contains("no published version matches"),
+            "{}",
+            omissions[0]
+        );
+    }
+
+    #[test]
+    fn required_fetch_failure_still_aborts_the_audit_walk() {
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert("root".into(), packument_with("1.0.0", &[("gone", "^1")]));
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
+        let err = Registry::npm()
+            .resolve_walk(&roots, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .unwrap_err();
+        assert!(err.to_string().contains("no packument for gone"), "{err}");
+    }
+
+    #[test]
+    fn a_name_needed_by_a_required_edge_aborts_even_after_an_optional_omission() {
+        // Round 2: a's optional edge on `x` fails → omission. Round 3: b's *required* edge on
+        // `x` must abort from the stored error — and `x` is fetched exactly once overall.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert("root".into(), packument_with("1.0.0", &[("a", "^1")]));
+        pkgs.insert(
+            "a".into(),
+            packument_with_optional("1.0.0", &[("b", "^1")], &[("x", "^1")]),
+        );
+        pkgs.insert("b".into(), packument_with("1.0.0", &[("x", "^1")]));
+
+        let attempts: std::sync::Mutex<std::collections::HashMap<String, usize>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let get = |name: &str| {
+            *attempts
+                .lock()
+                .unwrap()
+                .entry(name.to_string())
+                .or_insert(0) += 1;
+            pkgs.get(name)
+                .cloned()
+                .ok_or_else(|| format!("no packument for {name}").into())
+        };
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
+        let err = Registry::npm()
+            .resolve_walk(&roots, get, |_, _| {}, NESTED_AUDIT)
+            .unwrap_err();
+        assert!(err.to_string().contains("no packument for x"), "{err}");
+        assert_eq!(
+            attempts.into_inner().unwrap().get("x"),
+            Some(&1),
+            "a failed name is never re-fetched"
+        );
+    }
+
+    #[test]
+    fn transitive_git_spec_is_an_omission_nested_and_an_error_flat() {
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "a".into(),
+            packument_with(
+                "1.0.0",
+                &[("g", "git+https://github.com/x/y.git"), ("b", "^1")],
+            ),
+        );
+        pkgs.insert("b".into(), packument_with("1.0.0", &[]));
+
+        let roots3 = vec![("a".to_string(), "^1".parse().unwrap(), false)];
+        let (resolved, omissions) = Registry::npm()
+            .resolve_walk(&roots3, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .unwrap();
+        assert_eq!(pairs(&resolved), ["a@1.0.0", "b@1.0.0"]);
+        assert_eq!(omissions.len(), 1);
+        assert_eq!(
+            omissions[0].to_string(),
+            "g (git+https://github.com/x/y.git: git dependency)"
+        );
+
+        // The install walk keeps failing loudly on the same spec.
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let err = Registry::npm()
+            .resolve_tree_from(&roots, source_from(&pkgs))
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported version"), "{err}");
+    }
+
+    #[test]
+    fn npm_alias_to_a_registry_range_resolves_the_target() {
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "a".into(),
+            packument_with("1.0.0", &[("aliased", "npm:real@^1")]),
+        );
+        pkgs.insert("real".into(), packument_with("1.5.0", &[]));
+
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let resolved = Registry::npm()
+            .resolve_tree_nested_from(&roots, source_from(&pkgs))
+            .unwrap();
+        assert_eq!(
+            pairs(&resolved),
+            ["a@1.0.0", "real@1.5.0"],
+            "the alias target resolves under its real name"
+        );
+    }
+
+    #[test]
+    fn garbage_transitive_range_stays_a_hard_error_under_the_audit_policy() {
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert(
+            "a".into(),
+            packument_with("1.0.0", &[("bad", "%% nope %%")]),
+        );
+
+        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let err = Registry::npm()
+            .resolve_tree_nested_from(&roots, source_from(&pkgs))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported version"),
+            "malformed semver must fail clearly, not become an omission: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_dep_routes_protocols_aliases_and_ranges() {
+        let omit_reason = |spec: &str| match classify_dep("p", spec).unwrap() {
+            EdgeAction::Omit(o) => o.reason,
+            EdgeAction::Resolve { .. } => panic!("{spec:?} should be an omission"),
+        };
+        assert_eq!(omit_reason("workspace:*"), "workspace: protocol");
+        // `link:../x` would misread as a git shorthand through Spec::parse — the prefix check
+        // runs first.
+        assert_eq!(omit_reason("link:../x"), "link: protocol");
+        assert_eq!(
+            omit_reason("git+ssh://git@github.com/x/y.git"),
+            "git dependency"
+        );
+        assert_eq!(omit_reason("user/repo"), "git dependency");
+        assert_eq!(omit_reason("https://x.example/p.tgz"), "remote tarball");
+        assert_eq!(omit_reason("file:../local"), "local path");
+        assert_eq!(
+            omit_reason("npm:x@file:../y"),
+            "npm: alias to a non-registry target"
+        );
+
+        match classify_dep("aliased", "npm:target@^2").unwrap() {
+            EdgeAction::Resolve { name, .. } => assert_eq!(name, "target"),
+            EdgeAction::Omit(o) => panic!("alias to registry must resolve, got {o}"),
+        }
+        match classify_dep("plain", "^1.2").unwrap() {
+            EdgeAction::Resolve { name, .. } => assert_eq!(name, "plain"),
+            EdgeAction::Omit(o) => panic!("registry range must resolve, got {o}"),
+        }
+        assert!(classify_dep("bad", "%% nope %%").is_err());
+    }
+
+    #[test]
+    fn omission_display_names_the_spec_when_present() {
+        assert_eq!(
+            Omission::new("g", "git+ssh://x/y", "git dependency").to_string(),
+            "g (git+ssh://x/y: git dependency)"
+        );
+        assert_eq!(
+            Omission::new("workspaces", "", "not traversed").to_string(),
+            "workspaces (not traversed)"
+        );
+    }
+
+    #[test]
+    fn prefetch_concurrency_stays_within_the_cap() {
+        // A 12-name frontier (over the 8-thread cap); the fake fetch tracks its in-flight
+        // high-water mark. The tiny sleep gives workers a chance to overlap — the assertion is
+        // one-sided (never above the cap), so scheduling noise can't flake it.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        let leaves: Vec<String> = (1..=12).map(|i| format!("l{i:02}")).collect();
+        pkgs.insert(
+            "root".into(),
+            packument_with(
+                "1.0.0",
+                &leaves
+                    .iter()
+                    .map(|l| (l.as_str(), "^1"))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        for leaf in &leaves {
+            pkgs.insert(leaf.clone(), packument_with("1.0.0", &[]));
+        }
+
+        let in_flight = AtomicUsize::new(0);
+        let high_water = AtomicUsize::new(0);
+        let get = |name: &str| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            high_water.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            pkgs.get(name)
+                .cloned()
+                .ok_or_else(|| format!("no packument for {name}").into())
+        };
+
+        let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
+        let (resolved, _) = Registry::npm()
+            .resolve_walk(&roots, get, |_, _| {}, NESTED_AUDIT)
+            .unwrap();
+        assert_eq!(resolved.len(), 13);
+        assert!(
+            high_water.load(Ordering::SeqCst) <= PACKUMENT_CONCURRENCY,
+            "at most {PACKUMENT_CONCURRENCY} concurrent fetches, saw {}",
+            high_water.load(Ordering::SeqCst)
+        );
+    }
+
     #[test]
     fn parallel_prefetch_is_deterministic_and_fetches_each_name_once() {
         // Three levels, 12 distinct names — more than the 8-thread cap: root@1 → p01..p10 (^1
@@ -840,10 +1487,10 @@ mod tests {
                 .ok_or_else(|| format!("no packument for {name}").into())
         };
 
-        let roots = vec![("root".to_string(), "^1".parse().unwrap())];
+        let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
         let mut seen: Vec<usize> = Vec::new();
-        let resolved = Registry::npm()
-            .resolve_walk(&roots, get, |n, _| seen.push(n), true)
+        let (resolved, _) = Registry::npm()
+            .resolve_walk(&roots, get, |n, _| seen.push(n), NESTED_AUDIT)
             .unwrap();
 
         // Every name fetched exactly once, despite ten same-round requirements on `shared`.
@@ -878,9 +1525,9 @@ mod tests {
         pkgs.insert("b".into(), packument_with("1.2.0", &[("c", "^1")]));
         pkgs.insert("c".into(), packument_with("1.5.0", &[]));
 
-        let roots = vec![("a".to_string(), "^1".parse().unwrap())];
+        let roots = vec![("a".to_string(), "^1".parse().unwrap(), false)];
         let mut seen: Vec<String> = Vec::new();
-        let resolved = Registry::npm()
+        let (resolved, _) = Registry::npm()
             .resolve_walk(
                 &roots,
                 |name| {
@@ -889,7 +1536,7 @@ mod tests {
                         .ok_or_else(|| format!("no packument for {name}").into())
                 },
                 |n, r| seen.push(format!("{n} {}@{}", r.name, r.version)),
-                true,
+                NESTED_AUDIT,
             )
             .unwrap();
 

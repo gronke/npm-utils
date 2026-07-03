@@ -140,14 +140,21 @@ pub struct ComponentAdvisories {
 }
 
 /// The result of an audit: the vulnerable components (sorted by name then version), the per-severity
-/// totals across them, and the names of any advisory sources that could not be reached — so a caller
-/// can tell an incomplete run from a genuinely clean one.
+/// totals across them, the names of any advisory sources that could not be reached, and the
+/// dependencies the component loading could not audit — so a caller can tell an incomplete run
+/// from a genuinely clean one.
 #[derive(Debug, Clone)]
 pub struct AuditReport {
     pub findings: Vec<ComponentAdvisories>,
     pub vulnerabilities: Vulnerabilities,
     /// Advisory sources whose lookup failed; empty when every selected source answered.
     pub failed_sources: Vec<String>,
+    /// Dependencies the audited component set does **not** cover (manifest/spec sources only —
+    /// non-registry specs, workspaces, failed optional deps; always empty for a lockfile audit).
+    /// Distinct from [`failed_sources`](Self::failed_sources): these are inputs never checked,
+    /// not advisory databases that failed. [`run_audit`] leaves this empty; the caller that
+    /// loaded the components fills it in.
+    pub omissions: Vec<crate::registry::Omission>,
 }
 
 impl AuditReport {
@@ -156,10 +163,11 @@ impl AuditReport {
         self.advisories().filter_map(|a| a.severity).max()
     }
 
-    /// Whether the audit reached every selected source. `false` means the report may be missing
-    /// advisories (see [`failed_sources`](Self::failed_sources)).
+    /// Whether the audit reached every selected source *and* covered every dependency. `false`
+    /// means the report may be missing advisories (see
+    /// [`failed_sources`](Self::failed_sources) and [`omissions`](Self::omissions)).
     pub fn is_complete(&self) -> bool {
-        self.failed_sources.is_empty()
+        self.failed_sources.is_empty() && self.omissions.is_empty()
     }
 
     /// Whether any finding is at or above `level` — the `--audit-level` exit test. A confirmed
@@ -195,7 +203,7 @@ pub trait AdvisorySource {
 /// installed version ([`build_report`]). A source that fails is reported to stderr, recorded in the
 /// report's [`failed_sources`](AuditReport::failed_sources), and skipped — a single failing source
 /// never sinks the run, but the report is marked incomplete so the caller need not present it as clean.
-/// This is [`run_audit_observed`] with a no-op observer.
+/// This is `run_audit_observed` (the crate-internal eventful variant) with a no-op observer.
 pub fn run_audit(components: &[Component], sources: &[Box<dyn AdvisorySource>]) -> AuditReport {
     run_audit_observed(components, sources, |_| {})
 }
@@ -380,6 +388,7 @@ pub fn build_report(advisories: &[Advisory], components: &[Component]) -> AuditR
         findings,
         vulnerabilities: counts,
         failed_sources: Vec::new(),
+        omissions: Vec::new(),
     }
 }
 
@@ -394,22 +403,58 @@ fn count_one(v: &mut Vulnerabilities, severity: Option<Severity>) {
     v.total += 1;
 }
 
+/// The reason an audit is incomplete, for `AUDIT INCOMPLETE` renderings: failed advisory
+/// sources, unaudited dependencies, or both. `None` when the audit covered everything.
+fn incomplete_clause(report: &AuditReport) -> Option<String> {
+    let mut parts = Vec::new();
+    if !report.failed_sources.is_empty() {
+        parts.push(format!(
+            "{} source(s) failed ({})",
+            report.failed_sources.len(),
+            report.failed_sources.join(", "),
+        ));
+    }
+    if !report.omissions.is_empty() {
+        let n = report.omissions.len();
+        parts.push(format!(
+            "{n} dependenc{} not audited",
+            if n == 1 { "y" } else { "ies" },
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// The itemized unaudited-dependency note printed above the count header, so a clean count is
+/// never unqualified when the component set has gaps.
+fn omissions_note(report: &AuditReport) -> Option<String> {
+    if report.omissions.is_empty() {
+        return None;
+    }
+    let n = report.omissions.len();
+    let items: Vec<String> = report.omissions.iter().map(|o| o.to_string()).collect();
+    Some(format!(
+        "note: {n} dependenc{} not audited: {}",
+        if n == 1 { "y" } else { "ies" },
+        items.join(", "),
+    ))
+}
+
 /// A plain-text audit summary: a one-line count header, then each vulnerable `name@version` with its
-/// advisories. `found 0 vulnerabilities` when clean (mirrors `npm audit`).
+/// advisories. `found 0 vulnerabilities` when clean (mirrors `npm audit`). Unaudited dependencies
+/// are itemized in a `note:` line above the header and flag the audit `INCOMPLETE`.
 pub fn render_summary(report: &AuditReport) -> String {
     use std::fmt::Write as _;
     let v = &report.vulnerabilities;
     let mut s = String::new();
+    if let Some(note) = omissions_note(report) {
+        let _ = writeln!(s, "{note}");
+    }
     if v.total == 0 {
-        if report.failed_sources.is_empty() {
-            s.push_str("found 0 vulnerabilities\n");
-        } else {
-            let _ = writeln!(
-                s,
-                "found 0 vulnerabilities — AUDIT INCOMPLETE: {} source(s) failed ({})",
-                report.failed_sources.len(),
-                report.failed_sources.join(", "),
-            );
+        match incomplete_clause(report) {
+            None => s.push_str("found 0 vulnerabilities\n"),
+            Some(clause) => {
+                let _ = writeln!(s, "found 0 vulnerabilities — AUDIT INCOMPLETE: {clause}");
+            }
         }
         return s;
     }
@@ -443,13 +488,8 @@ pub fn render_summary(report: &AuditReport) -> String {
             let _ = writeln!(s, "    {detail}");
         }
     }
-    if !report.failed_sources.is_empty() {
-        let _ = writeln!(
-            s,
-            "\nAUDIT INCOMPLETE: {} source(s) failed ({}) — findings may be missing",
-            report.failed_sources.len(),
-            report.failed_sources.join(", "),
-        );
+    if let Some(clause) = incomplete_clause(report) {
+        let _ = writeln!(s, "\nAUDIT INCOMPLETE: {clause} — findings may be missing");
     }
     s
 }
@@ -506,10 +546,16 @@ pub fn render_json(report: &AuditReport) -> String {
                 "total": v.total,
             },
         },
-        // Extensions beyond `npm audit --json` so a machine can distinguish an incomplete audit from
-        // a clean one: `incomplete` is true when any source failed; `failed_sources` names them.
-        "incomplete": !report.failed_sources.is_empty(),
+        // Extensions beyond `npm audit --json` so a machine can distinguish an incomplete audit
+        // from a clean one: `incomplete` is true when any source failed or any dependency went
+        // unaudited; `failed_sources` and `omissions` say which.
+        "incomplete": !report.is_complete(),
         "failed_sources": report.failed_sources,
+        "omissions": report.omissions.iter().map(|o| json!({
+            "name": o.name,
+            "spec": o.spec,
+            "reason": o.reason,
+        })).collect::<Vec<Value>>(),
     });
     let mut s = serde_json::to_string_pretty(&doc).expect("serialize audit report");
     s.push('\n');
@@ -770,6 +816,7 @@ mod tests {
             findings: vec![],
             vulnerabilities: Vulnerabilities::default(),
             failed_sources: vec![],
+            omissions: vec![],
         };
         assert_eq!(render_summary(&empty), "found 0 vulnerabilities\n");
 
@@ -778,5 +825,68 @@ mod tests {
         assert_eq!(doc["vulnerabilities"]["lodash"]["severity"], "high");
         assert_eq!(doc["metadata"]["vulnerabilities"]["high"], 1);
         assert_eq!(doc["metadata"]["vulnerabilities"]["total"], 1);
+        assert_eq!(doc["incomplete"], false);
+        assert_eq!(
+            doc["omissions"],
+            json!([]),
+            "always present, empty by default"
+        );
+    }
+
+    #[test]
+    fn omissions_qualify_a_clean_summary_and_mark_it_incomplete() {
+        let report = AuditReport {
+            findings: vec![],
+            vulnerabilities: Vulnerabilities::default(),
+            failed_sources: vec![],
+            omissions: vec![crate::registry::Omission::new(
+                "g",
+                "git+ssh://x/y",
+                "git dependency",
+            )],
+        };
+        assert!(!report.is_complete());
+        let s = render_summary(&report);
+        assert_eq!(
+            s,
+            "note: 1 dependency not audited: g (git+ssh://x/y: git dependency)\n\
+             found 0 vulnerabilities — AUDIT INCOMPLETE: 1 dependency not audited\n"
+        );
+    }
+
+    #[test]
+    fn omissions_and_failed_sources_compose_in_summary_and_json() {
+        let advisories = vec![advisory(
+            "npm",
+            "GHSA-h",
+            &["GHSA-h"],
+            "<2.0.0",
+            Some(Severity::High),
+        )];
+        let mut report = build_report(&advisories, &[component("lodash", "1.0.0")]);
+        report.failed_sources = vec!["osv".into()];
+        report.omissions = vec![
+            crate::registry::Omission::new("w", "file:../w", "local path"),
+            crate::registry::Omission::new("workspaces", "", "not traversed"),
+        ];
+
+        let s = render_summary(&report);
+        // The note leads, the count header follows intact, the trailing block names both gaps.
+        let note_pos = s.find("note: 2 dependencies not audited:").unwrap();
+        let found_pos = s.find("found 1 vulnerability").unwrap();
+        assert!(note_pos < found_pos, "{s}");
+        assert!(
+            s.contains(
+                "AUDIT INCOMPLETE: 1 source(s) failed (osv), 2 dependencies not audited \
+                 — findings may be missing"
+            ),
+            "{s}"
+        );
+
+        let doc: Value = serde_json::from_str(&render_json(&report)).unwrap();
+        assert_eq!(doc["incomplete"], true);
+        assert_eq!(doc["omissions"][0]["name"], "w");
+        assert_eq!(doc["omissions"][0]["reason"], "local path");
+        assert_eq!(doc["omissions"][1]["spec"], "");
     }
 }

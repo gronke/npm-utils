@@ -58,8 +58,21 @@ pub fn remove_dependency(doc: &mut Value, name: &str) -> bool {
 /// The `(name, range)` pairs of the `dependencies` object (string values only), sorted by name.
 /// Empty when there is no `dependencies` object.
 pub fn dependencies(doc: &Value) -> Vec<(String, String)> {
+    string_entries(doc, "dependencies")
+}
+
+/// [`dependencies`], for the `optionalDependencies` object. npm installs optional deps by
+/// default (tolerating their failure), so a production-facing reading of a manifest — an audit
+/// in particular — must consider them too.
+pub fn optional_dependencies(doc: &Value) -> Vec<(String, String)> {
+    string_entries(doc, "optionalDependencies")
+}
+
+/// The `(name, range)` pairs of one dependency object (string values only), sorted by name;
+/// empty when the key is absent.
+fn string_entries(doc: &Value, key: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = doc
-        .get("dependencies")
+        .get(key)
         .and_then(Value::as_object)
         .map(|map| {
             map.iter()
