@@ -195,13 +195,48 @@ pub trait AdvisorySource {
 /// installed version ([`build_report`]). A source that fails is reported to stderr, recorded in the
 /// report's [`failed_sources`](AuditReport::failed_sources), and skipped — a single failing source
 /// never sinks the run, but the report is marked incomplete so the caller need not present it as clean.
+/// This is [`run_audit_observed`] with a no-op observer.
 pub fn run_audit(components: &[Component], sources: &[Box<dyn AdvisorySource>]) -> AuditReport {
+    run_audit_observed(components, sources, |_| {})
+}
+
+/// A progress event from [`run_audit_observed`]'s per-source loop, in emission order: `Begin`
+/// fires immediately before a source is queried, then exactly one of `Done` (with the number of
+/// advisories that source returned, before cross-source dedup and installed-version filtering)
+/// or `Failed`. The CLI renders these as stderr status lines; [`run_audit`] discards them.
+pub(crate) enum SourceEvent<'a> {
+    Begin { name: &'a str },
+    Done { name: &'a str, advisories: usize },
+    Failed { name: &'a str },
+}
+
+/// [`run_audit`] with a progress observer — the same querying, failure recording, dedup, and
+/// report building; `on_event` additionally sees one [`SourceEvent::Begin`] and one `Done`/`Failed`
+/// per source, in order. `Failed` fires before the stderr cause line, so a status renderer can
+/// close its line first. The returned [`AuditReport`] is identical to [`run_audit`]'s.
+pub(crate) fn run_audit_observed(
+    components: &[Component],
+    sources: &[Box<dyn AdvisorySource>],
+    mut on_event: impl FnMut(SourceEvent<'_>),
+) -> AuditReport {
     let mut all = Vec::new();
     let mut failed_sources = Vec::new();
     for source in sources {
+        on_event(SourceEvent::Begin {
+            name: source.name(),
+        });
         match source.query(components) {
-            Ok(advisories) => all.extend(advisories),
+            Ok(advisories) => {
+                on_event(SourceEvent::Done {
+                    name: source.name(),
+                    advisories: advisories.len(),
+                });
+                all.extend(advisories);
+            }
             Err(e) => {
+                on_event(SourceEvent::Failed {
+                    name: source.name(),
+                });
                 eprintln!(
                     "npm-utils: {} advisory source failed: {e}; audit results may be incomplete",
                     source.name()
@@ -541,6 +576,52 @@ mod tests {
             resolved: None,
             integrity: None,
         }
+    }
+
+    /// Fake sources for the observed-loop test: one succeeds with `usize` advisories, one fails.
+    struct OkSource(&'static str, usize);
+    impl AdvisorySource for OkSource {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn query(&self, _: &[Component]) -> crate::Result<Vec<Advisory>> {
+            Ok((0..self.1)
+                .map(|i| advisory("fake", &format!("GHSA-ok-{i}"), &[], "<9", None))
+                .collect())
+        }
+    }
+    struct BadSource;
+    impl AdvisorySource for BadSource {
+        fn name(&self) -> &'static str {
+            "bad"
+        }
+        fn query(&self, _: &[Component]) -> crate::Result<Vec<Advisory>> {
+            Err("simulated outage".into())
+        }
+    }
+
+    #[test]
+    fn run_audit_observed_emits_begin_done_failed_in_order() {
+        let sources: Vec<Box<dyn AdvisorySource>> =
+            vec![Box::new(OkSource("ok", 2)), Box::new(BadSource)];
+        let components = [component("lodash", "4.17.20")];
+
+        let mut events: Vec<String> = Vec::new();
+        let observed = run_audit_observed(&components, &sources, |e| {
+            events.push(match e {
+                SourceEvent::Begin { name } => format!("begin {name}"),
+                SourceEvent::Done { name, advisories } => format!("done {name} {advisories}"),
+                SourceEvent::Failed { name } => format!("failed {name}"),
+            });
+        });
+
+        assert_eq!(events, ["begin ok", "done ok 2", "begin bad", "failed bad"]);
+        assert_eq!(observed.failed_sources, ["bad".to_string()]);
+
+        // The observer changes nothing about the report itself.
+        let plain = run_audit(&components, &sources);
+        assert_eq!(observed.vulnerabilities.total, plain.vulnerabilities.total);
+        assert_eq!(observed.failed_sources, plain.failed_sources);
     }
 
     #[test]

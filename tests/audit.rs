@@ -379,6 +379,70 @@ mod cli {
         assert_eq!(out.status.code(), Some(0), "--allow-incomplete → exit 0");
     }
 
+    /// Status lines land on stderr by default: the resolution phase for a manifest source and one
+    /// begin/done pair per advisory source (emitted even for an empty component set). Offline —
+    /// a zero-dep manifest resolves without network and empty components short-circuit the
+    /// sources' queries.
+    #[test]
+    fn status_lines_appear_on_stderr_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &[]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("resolving dependency tree"), "{stderr}");
+        assert!(stderr.contains("querying npm advisories"), "{stderr}");
+        assert!(stderr.contains("querying osv advisories"), "{stderr}");
+        // The report itself stays on stdout, unchanged.
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
+    /// `-q`/`--quiet` silences the status lines — and only them.
+    #[test]
+    fn quiet_suppresses_status_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &["-q"]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("resolving"), "{stderr}");
+        assert!(!stderr.contains("querying"), "{stderr}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
+    /// `--quiet` never suppresses real errors: the `npm-utils:` line still reaches stderr.
+    #[test]
+    fn quiet_never_suppresses_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = audit(dir.path(), &["--quiet"]);
+        assert_ne!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("npm-utils:"), "{stderr}");
+        assert!(
+            stderr.contains("no package-lock.json or package.json"),
+            "{stderr}"
+        );
+    }
+
+    /// The resolution status line names the effective `--registry`, and a resolution failure
+    /// arrives after the begin line, on its own line. Offline: a refused localhost port.
+    #[test]
+    fn resolution_line_names_the_effective_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), r#"{ "lodash": "^4" }"#);
+        let out = audit(
+            dir.path().join("package.json"),
+            &["--registry", "https://localhost:1"],
+        );
+        assert_ne!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("resolving dependency tree from localhost:1"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("npm-utils:"), "{stderr}");
+    }
+
     /// A manifest whose parents disagree on a package (a direct `glob` 5 pin vs globby@0.1.1's
     /// frozen `glob ^4.0.2`) resolves nested like npm and audits every version — the flat
     /// installer's "version conflict" error must not reach the audit.

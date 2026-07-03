@@ -3,7 +3,8 @@
 //! Pure-Rust npm verbs over the crate's primitives — it mirrors npm's vocabulary for the subset it
 //! supports and is deliberately **not** a full npm drop-in. Each verb lives in its own submodule;
 //! the shared helpers they lean on (manifest read/write, the lock+install `sync` that `add` and
-//! `upgrade` both run, install reporting) live in the `common` submodule.
+//! `upgrade` both run, install reporting) live in the `common` submodule, and the stderr status
+//! reporting behind the global `-q`/`--quiet` lives in `progress`.
 //!
 //! - `install` — record any given package sources (`name` / `name@range` / `name=range`) in
 //!   `package.json`, then resolve its `dependencies`, write `package-lock.json`, and install
@@ -36,6 +37,7 @@ mod common;
 mod download;
 mod init;
 mod install;
+mod progress;
 mod remove;
 mod resolve;
 mod sbom;
@@ -64,6 +66,9 @@ struct Cli {
     /// Disable download timeouts entirely (no per-fetch or connect bound)
     #[arg(long, global = true)]
     no_timeout: bool,
+    /// Suppress status lines on stderr (reports on stdout and npm-utils: error messages still print)
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -240,6 +245,7 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
         cli.timeout,
         cli.no_timeout,
     ));
+    let quiet = cli.quiet;
     match cli.command {
         Command::Install {
             sources,
@@ -288,6 +294,7 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             sources.as_deref(),
             registry.as_deref(),
             allow_incomplete,
+            &progress::Progress::new(quiet),
         ),
     }
 }
@@ -422,6 +429,18 @@ mod tests {
         ]))
         .is_err());
         assert!(Cli::try_parse_from(osv(&["npm-utils", "--timeout", "soon", "install"])).is_err());
+    }
+
+    #[test]
+    fn cli_accepts_global_quiet_flag() {
+        // `-q`/`--quiet` is global: accepted before or after the verb, on any verb.
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "-q", "audit", "/tmp/x"])).is_ok());
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "audit", "lit=^3", "--quiet"])).is_ok());
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "install", "-q"])).is_ok());
+        // The flag actually lands, and defaults to off.
+        let quiet = |args: &[&str]| Cli::try_parse_from(osv(args)).unwrap().quiet;
+        assert!(quiet(&["npm-utils", "-q", "audit"]));
+        assert!(!quiet(&["npm-utils", "audit"]));
     }
 
     #[test]

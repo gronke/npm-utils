@@ -122,6 +122,7 @@ Commands:
 Options:
       --timeout <SECS>  Per-fetch timeout in seconds (default 120) — caps each registry/tarball request, not the whole run
       --no-timeout      Disable download timeouts entirely (no per-fetch or connect bound)
+  -q, --quiet           Suppress status lines on stderr (reports on stdout and npm-utils: error messages still print)
   -h, --help            Print help
   -V, --version         Print version
 ```
@@ -201,6 +202,13 @@ another pins `5.0.15`), every resolved version is kept and audited — an audit 
 than installs, and if the tree would contain both versions, both versions' advisories matter.
 A lockfile source audits exactly what the lock pins, dev dependencies included; prefer it when one
 exists.
+
+Resolving a manifest or spec source and querying each advisory source can take a while (every fetch
+is bounded by `--timeout`, 120 s by default), so `audit` reports progress on **stderr**: a live
+package counter during resolution on a terminal (plain begin/end lines with elapsed seconds when
+piped), and one `querying <source> advisories …` line pair per advisory source. `-q`/`--quiet`
+silences these status lines; the report on stdout (including `--format json`) and `npm-utils:`
+errors are never affected, so piping stdout stays clean either way.
 
 It mirrors npm's exit semantics: `--audit-level <low|moderate|high|critical>` sets the bar, and the
 command exits `1` **only** when a finding at or above it exists (default `low` — any vuln fails).
