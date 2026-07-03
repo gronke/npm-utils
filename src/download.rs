@@ -50,7 +50,8 @@ static TIMEOUTS: OnceLock<Timeouts> = OnceLock::new();
 
 /// Override the process-wide download timeouts. Intended to be called once at startup (the CLI
 /// derives them from `--timeout` / `--no-timeout`); the library default applies if never set, and a
-/// later call is ignored.
+/// later call is ignored. The shared agent captures the timeouts when the first download builds it,
+/// so call this before any fetch — set after that, the values are inert.
 pub fn set_timeouts(timeouts: Timeouts) {
     let _ = TIMEOUTS.set(timeouts);
 }
@@ -59,22 +60,36 @@ fn timeouts() -> Timeouts {
     TIMEOUTS.get().copied().unwrap_or_default()
 }
 
-/// The shared HTTP agent — platform-verifier TLS plus the process-wide download timeouts. Used by
-/// every request helper here ([`fetch_with_accept`], [`post_json`]) so they share one TLS/timeout
-/// policy and honour `--timeout` / `--no-timeout`.
+/// The process-wide HTTP agent, built once on first use — ureq's `Agent` is an `Arc`-backed cheap
+/// clone sharing one connection pool, so every fetch in the process reuses warm TCP+TLS
+/// connections instead of re-handshaking per request. Every request helper here
+/// ([`fetch_with_accept`], [`post_json`]) goes through it, sharing one TLS/timeout policy that
+/// honours `--timeout` / `--no-timeout`.
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
 fn agent() -> ureq::Agent {
-    let t = timeouts();
-    ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .tls_config(
-                TlsConfig::builder()
-                    .root_certs(RootCerts::PlatformVerifier)
+    AGENT
+        .get_or_init(|| {
+            let t = timeouts();
+            ureq::Agent::new_with_config(
+                ureq::Agent::config_builder()
+                    .tls_config(
+                        TlsConfig::builder()
+                            .root_certs(RootCerts::PlatformVerifier)
+                            .build(),
+                    )
+                    .timeout_connect(t.connect)
+                    .timeout_global(t.global)
+                    // The resolver prefetches packuments 8-wide against a single registry host
+                    // (`registry`'s PACKUMENT_CONCURRENCY); ureq's idle-pool defaults (3 per
+                    // host, 10 total) would drop and re-handshake most of those connections
+                    // between rounds.
+                    .max_idle_connections_per_host(8)
+                    .max_idle_connections(16)
                     .build(),
             )
-            .timeout_connect(t.connect)
-            .timeout_global(t.global)
-            .build(),
-    )
+        })
+        .clone()
 }
 
 /// Download an `https://` URL into memory (100 MB cap), retrying once on transient failure.
