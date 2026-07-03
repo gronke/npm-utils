@@ -3,11 +3,11 @@
 //! A batched `POST /v1/querybatch` returns vulnerability ids per query (positionally, one result
 //! list per queried component); each id is then hydrated with `GET /v1/vulns/{id}` for the full
 //! record — structured `affected` ranges, aliases (CVE/GHSA), and severity. The endpoint rejects
-//! more than [`QUERYBATCH_LIMIT`] queries per request (`400 "Too many queries."`), so larger
+//! more than `QUERYBATCH_LIMIT` queries per request (`400 "Too many queries."`), so larger
 //! component sets are sent as pages. OSV records span many packages and ecosystems, so a record
 //! is only relevant when one of its `affected` entries is the npm package we asked about; that
 //! entry's SEMVER `events` are turned into a `>=`/`<` range string the shared
-//! [`Range`](crate::package_json::spec::Range) matcher can post-filter.
+//! [`Range`] matcher can post-filter.
 
 use std::collections::HashMap;
 

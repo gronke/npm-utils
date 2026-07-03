@@ -4,10 +4,14 @@
 //! `--audit-level` threshold is found. The positional source names what to audit — a project
 //! directory (its `package-lock.json`, else its `package.json`), an explicit manifest or lockfile
 //! path, or a registry spec `name=range` (e.g. `lit=^3`). Manifest and spec sources resolve their
-//! production tree against the registry **in memory**; `audit` never writes a lockfile. A
-//! missing/garbage source is a real error (nonzero with a message). One unreachable advisory
-//! source degrades and continues; if *every* selected source fails the audit is incomplete and
-//! exits `2` (fail closed) unless `--allow-incomplete` is given.
+//! registry-reachable `dependencies` + `optionalDependencies` tree **in memory**; `audit` never
+//! writes a lockfile. Whatever that resolution cannot follow — git / path / tarball /
+//! `workspace:` specs, workspace packages, optional deps that fail to resolve — is reported as
+//! an **omission** (devDependencies are never resolved from a manifest; audit the lockfile to
+//! include them). A missing/garbage source is a real error (nonzero with a message). One
+//! unreachable advisory source degrades and continues. The audit fails closed with exit `2`
+//! when it is incomplete — every selected source failed, or any dependency went unaudited —
+//! unless `--allow-incomplete` is given.
 
 use std::io::Write as _;
 
@@ -20,9 +24,9 @@ use super::Res;
 use crate::audit::npm::NpmRegistrySource;
 use crate::audit::osv::OsvSource;
 use crate::audit::{self, AdvisorySource, Severity, SourceEvent};
-use crate::package_json::lock::{registry_roots, Lockfile};
+use crate::package_json::lock::{audit_roots, Lockfile};
 use crate::package_json::manifest;
-use crate::registry::Registry;
+use crate::registry::{Omission, Registry};
 use crate::sbom::{self, Component};
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
@@ -65,10 +69,11 @@ pub(super) enum SourceKind {
 
 /// Load the source's packages (a lockfile as pinned; a manifest or spec resolved in memory), query
 /// the selected advisory sources, and print the report. Exits `1` when an advisory at or above
-/// `audit_level` is found (after printing), `0` when clean. Status lines — a live resolution line
-/// for manifest/spec sources and one begin/done pair per advisory source, emitted even for an
-/// empty component set — go to stderr via `progress`; `--quiet` silences them, never the report
-/// or errors.
+/// `audit_level` is found (after printing), `2` when the audit is incomplete — every source
+/// failed, or some dependencies could not be audited — unless `--allow-incomplete`, and `0` when
+/// clean. Status lines — a live resolution line for manifest/spec sources and one begin/done
+/// pair per advisory source, emitted even for an empty component set — go to stderr via
+/// `progress`; `--quiet` silences them, never the report or errors.
 pub(super) fn run(
     source: &str,
     audit_level: AuditLevel,
@@ -80,13 +85,13 @@ pub(super) fn run(
 ) -> Res {
     let src = Source::parse(source, BareToken::Path)?;
     let reg = Registry::with_base_url(registry.unwrap_or(DEFAULT_REGISTRY));
-    let components = load_components(&src, &reg, progress)?;
+    let (components, omissions) = load_components(&src, &reg, progress)?;
 
     let active = build_sources(sources, registry);
     // Render each source's Begin/Done/Failed as a terminated line pair; every Begin is followed
     // by exactly one Done/Failed, so `phase` is None again when run_audit_observed returns.
     let mut phase: Option<Phase> = None;
-    let report = audit::run_audit_observed(&components, &active, |event| match event {
+    let mut report = audit::run_audit_observed(&components, &active, |event| match event {
         SourceEvent::Begin { name } => {
             phase = Some(progress.step(format!("querying {name} advisories")));
         }
@@ -103,13 +108,14 @@ pub(super) fn run(
         }
     });
 
+    report.omissions = omissions;
     let out = match format {
         Format::Summary => audit::render_summary(&report),
         Format::Json => audit::render_json(&report),
     };
     print!("{out}");
 
-    // A finding at/above the threshold, and a fully-incomplete audit, are both nonzero *results*
+    // A finding at/above the threshold, and an incomplete audit, are both nonzero *results*
     // (not tool errors): print to stdout and exit directly, bypassing `main_with`'s
     // `npm-utils: <err>` path. Flush first — `process::exit` runs no destructors.
     let all_sources_failed = !active.is_empty() && report.failed_sources.len() == active.len();
@@ -124,26 +130,37 @@ pub(super) fn run(
         let _ = std::io::stdout().flush();
         std::process::exit(1);
     }
+    if !report.omissions.is_empty() && !allow_incomplete {
+        // Unaudited dependencies: otherwise clean, but incomplete — fail closed like the
+        // all-sources-failed path (a real finding's exit 1 takes precedence above; override
+        // with --allow-incomplete).
+        let _ = std::io::stdout().flush();
+        std::process::exit(2);
+    }
     Ok(())
 }
 
-/// The packages a source names, as audit components — always assembled in memory (`audit` never
-/// writes a lockfile or anything else to disk).
+/// The packages a source names, as audit components plus the [`Omission`]s the loading could
+/// not cover — always assembled in memory (`audit` never writes a lockfile or anything else to
+/// disk).
 ///
-/// A lockfile audits exactly what it pins (dev deps included when the lock records them); a
-/// manifest or `name=range` spec resolves its **production** tree against `registry` first —
-/// npm-style nested, so requirements that disagree keep and audit *every* resolved version —
-/// while non-registry deps (git / `file:`) are skipped, as in the lockfile writer.
+/// A lockfile audits exactly what it pins (dev deps included when the lock records them; no
+/// omissions); a manifest or `name=range` spec resolves its registry-reachable `dependencies` +
+/// `optionalDependencies` tree against `registry` — npm-style nested, so requirements that
+/// disagree keep and audit *every* resolved version — and reports everything else (non-registry
+/// specs, workspaces, failed optional deps) as omissions. devDependencies are not resolved from
+/// a manifest.
 fn load_components(
     source: &Source,
     registry: &Registry,
     progress: &Progress,
-) -> Res<Vec<Component>> {
+) -> Res<(Vec<Component>, Vec<Omission>)> {
     match source {
         Source::Dir(dir) => {
             let lock = dir.join("package-lock.json");
             if lock.exists() {
-                return Ok(sbom::components(&Lockfile::parse(&read_text(&lock)?)?));
+                let components = sbom::components(&Lockfile::parse(&read_text(&lock)?)?);
+                return Ok((components, Vec::new()));
             }
             if dir.join("package.json").exists() {
                 return components_from_manifest(
@@ -157,7 +174,7 @@ fn load_components(
         Source::File(path) => {
             let text = read_text(path)?;
             match classify_file(path, &text) {
-                FileKind::Lockfile => Ok(sbom::components(&Lockfile::parse(&text)?)),
+                FileKind::Lockfile => Ok((sbom::components(&Lockfile::parse(&text)?), Vec::new())),
                 FileKind::Manifest => {
                     let doc: Value = serde_json::from_str(&text)
                         .map_err(|e| format!("parsing {}: {e}", path.display()))?;
@@ -165,8 +182,8 @@ fn load_components(
                 }
             }
         }
-        // A spec is a one-dependency virtual manifest, so `lit=^3` audits the full transitive
-        // production tree — "what would this package pull into my app?".
+        // A spec is a one-dependency virtual manifest, so `lit=^3` audits the package's full
+        // transitive dependency tree — "what would this package pull into my app?".
         Source::Spec { name, range } => {
             let mut doc = manifest::scaffold("npm-utils-audit", "0.0.0");
             manifest::upsert_dependency(&mut doc, name, range.as_deref().unwrap_or("*"));
@@ -175,27 +192,30 @@ fn load_components(
     }
 }
 
-/// Resolve a manifest's production tree in memory and adapt it to components. The resolution is
-/// npm-style **nested** ([`Registry::resolve_tree_nested`]): where requirements disagree, every
-/// resolved version is kept and audited — an audit flags issues rather than installs, and when
-/// the tree would contain two versions of a package, both versions' advisories matter. Nothing
-/// touches the filesystem.
+/// Resolve a manifest's registry-reachable dependency tree in memory and adapt it to
+/// components, with the entries the audit cannot cover as omissions (manifest roots first, then
+/// the walk's, each set deterministically ordered). The resolution is npm-style **nested**
+/// ([`Registry::resolve_tree_nested`]): where requirements disagree, every resolved version is
+/// kept and audited — an audit flags issues rather than installs, and when the tree would
+/// contain two versions of a package, both versions' advisories matter. Nothing touches the
+/// filesystem.
 fn components_from_manifest(
     doc: &Value,
     registry: &Registry,
     progress: &Progress,
-) -> Res<Vec<Component>> {
+) -> Res<(Vec<Component>, Vec<Omission>)> {
     // Roots first: a garbage manifest errors before any status line begins.
-    let roots = registry_roots(doc)?;
+    let (roots, mut omissions) = audit_roots(doc)?;
     let mut phase = progress.counted(format!(
         "resolving dependency tree from {}",
         host_of(&registry.base_url)
     ));
-    let resolved = registry.resolve_tree_nested_observed(&roots, |n, r| {
+    let (resolved, walk_omissions) = registry.resolve_tree_nested_observed(&roots, |n, r| {
         phase.tick(&format!("{n} {}@{}", r.name, r.version))
     })?;
     phase.finish(&format!("{} packages", resolved.len()));
-    Ok(sbom::components_from_resolved(&resolved))
+    omissions.extend(walk_omissions);
+    Ok((sbom::components_from_resolved(&resolved), omissions))
 }
 
 /// The display host of a registry base URL — scheme and path stripped

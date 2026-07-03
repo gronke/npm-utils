@@ -5,7 +5,7 @@
 //!
 //! - [`registry`] — talk to an npm registry: build tarball URLs, fetch a
 //!   package's metadata, resolve the newest version matching a semver range, and
-//!   search the registry ([`registry::search`]).
+//!   search the registry ([`Registry::search`](registry::Registry::search)).
 //! - [`download`] — fetch bytes over HTTP (with a retry) and build GitHub
 //!   archive URLs.
 //! - [`extract`] — unpack `.tar.gz` and `.zip` archives into a destination

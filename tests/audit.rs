@@ -200,6 +200,14 @@ fn unknown_severity_confirmed_finding_trips_the_threshold() {
     assert!(audit::render_summary(&report).contains("UNKNOWN"));
 }
 
+/// Paging regression lock: an empty component set short-circuits before any OSV request, so
+/// this stays offline-deterministic.
+#[test]
+fn osv_query_of_nothing_is_ok_offline() {
+    let advisories = npm_utils::audit::osv::OsvSource.query(&[]).unwrap();
+    assert!(advisories.is_empty());
+}
+
 // ----- CLI end-to-end (the `cli` bin and exit codes) -----------------------------------------
 
 #[cfg(feature = "cli")]
@@ -462,6 +470,57 @@ mod cli {
         assert!(stderr.contains("npm-utils:"), "{stderr}");
     }
 
+    /// A manifest whose deps cannot be audited (git / `file:` / workspaces) resolves to zero
+    /// registry roots — fully offline — and fails closed: the note qualifies the clean count,
+    /// JSON carries structured omissions, exit is 2, and --allow-incomplete opts into 0.
+    #[test]
+    fn unauditable_manifest_dependencies_fail_closed_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+              "name": "demo",
+              "version": "1.0.0",
+              "dependencies": { "g": "git+ssh://git@github.com/x/y.git" },
+              "optionalDependencies": { "local": "file:../local" },
+              "workspaces": ["packages/*"]
+            }"#,
+        )
+        .unwrap();
+
+        let out = audit(dir.path(), &[]);
+        assert_eq!(out.status.code(), Some(2), "incomplete audits fail closed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("note: 3 dependencies not audited:"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("g (git+ssh://git@github.com/x/y.git: git dependency)"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("found 0 vulnerabilities — AUDIT INCOMPLETE"),
+            "{stdout}"
+        );
+
+        let out = audit(dir.path(), &["--format", "json"]);
+        assert_eq!(out.status.code(), Some(2));
+        let doc: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("audit --json emits valid JSON");
+        assert_eq!(doc["incomplete"], serde_json::json!(true));
+        assert_eq!(doc["omissions"][0]["name"], "g");
+        assert_eq!(doc["omissions"][0]["reason"], "git dependency");
+        assert_eq!(doc["omissions"][2]["name"], "workspaces");
+
+        let out = audit(dir.path(), &["--allow-incomplete"]);
+        assert_eq!(out.status.code(), Some(0), "--allow-incomplete → fail-open");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("note:"),
+            "the note prints regardless of the exit policy"
+        );
+    }
+
     /// A manifest whose parents disagree on a package (a direct `glob` 5 pin vs globby@0.1.1's
     /// frozen `glob ^4.0.2`) resolves nested like npm and audits every version — the flat
     /// installer's "version conflict" error must not reach the audit.
@@ -497,6 +556,24 @@ mod cli {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("lodash@4.17.11"), "{stdout}");
         assert!(stdout.contains("GHSA-"), "{stdout}");
+    }
+
+    /// Live: an `npm:` alias in a manifest resolves and audits its *target* instead of aborting
+    /// or leaving a gap — the report stays complete.
+    #[test]
+    #[ignore = "network: resolves a real npm: alias via the registry"]
+    fn live_audit_manifest_with_alias_resolves_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), r#"{ "swc": "npm:string-width@^4.2.0" }"#);
+        let out = audit(dir.path().join("package.json"), &["--format", "json"]);
+        assert!(
+            matches!(out.status.code(), Some(0) | Some(1)),
+            "never incomplete: {:?}",
+            out.status.code()
+        );
+        let doc: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("audit --json emits valid JSON");
+        assert_eq!(doc["omissions"], serde_json::json!([]));
     }
 
     #[test]
