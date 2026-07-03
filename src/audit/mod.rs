@@ -201,13 +201,22 @@ pub fn run_audit(components: &[Component], sources: &[Box<dyn AdvisorySource>]) 
 }
 
 /// A progress event from [`run_audit_observed`]'s per-source loop, in emission order: `Begin`
-/// fires immediately before a source is queried, then exactly one of `Done` (with the number of
-/// advisories that source returned, before cross-source dedup and installed-version filtering)
-/// or `Failed`. The CLI renders these as stderr status lines; [`run_audit`] discards them.
+/// fires immediately before a source is queried (naming it), then exactly one of `Done` (with
+/// the number of advisories that source returned, before cross-source dedup and
+/// installed-version filtering) or `Failed` — so the source a `Done`/`Failed` concerns is the
+/// one the preceding `Begin` named. The CLI renders these as stderr status lines; [`run_audit`]
+/// discards them. The data fields are read only by that feature-gated renderer, hence the
+/// library-only `allow(dead_code)`.
 pub(crate) enum SourceEvent<'a> {
-    Begin { name: &'a str },
-    Done { name: &'a str, advisories: usize },
-    Failed { name: &'a str },
+    Begin {
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        name: &'a str,
+    },
+    Done {
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        advisories: usize,
+    },
+    Failed,
 }
 
 /// [`run_audit`] with a progress observer — the same querying, failure recording, dedup, and
@@ -228,15 +237,12 @@ pub(crate) fn run_audit_observed(
         match source.query(components) {
             Ok(advisories) => {
                 on_event(SourceEvent::Done {
-                    name: source.name(),
                     advisories: advisories.len(),
                 });
                 all.extend(advisories);
             }
             Err(e) => {
-                on_event(SourceEvent::Failed {
-                    name: source.name(),
-                });
+                on_event(SourceEvent::Failed);
                 eprintln!(
                     "npm-utils: {} advisory source failed: {e}; audit results may be incomplete",
                     source.name()
@@ -610,12 +616,13 @@ mod tests {
         let observed = run_audit_observed(&components, &sources, |e| {
             events.push(match e {
                 SourceEvent::Begin { name } => format!("begin {name}"),
-                SourceEvent::Done { name, advisories } => format!("done {name} {advisories}"),
-                SourceEvent::Failed { name } => format!("failed {name}"),
+                SourceEvent::Done { advisories } => format!("done {advisories}"),
+                SourceEvent::Failed => "failed".to_string(),
             });
         });
 
-        assert_eq!(events, ["begin ok", "done ok 2", "begin bad", "failed bad"]);
+        // A `Done`/`Failed` concerns the source the preceding `Begin` named.
+        assert_eq!(events, ["begin ok", "done 2", "begin bad", "failed"]);
         assert_eq!(observed.failed_sources, ["bad".to_string()]);
 
         // The observer changes nothing about the report itself.

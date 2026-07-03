@@ -205,7 +205,7 @@ exists.
 
 Resolving a manifest or spec source and querying each advisory source can take a while (every fetch
 is bounded by `--timeout`, 120 s by default), so `audit` reports progress on **stderr**: a live
-package counter during resolution on a terminal (plain begin/end lines with elapsed seconds when
+line naming each dependency as it resolves on a terminal (plain begin/end lines with elapsed seconds when
 piped), and one `querying <source> advisories …` line pair per advisory source. `-q`/`--quiet`
 silences these status lines; the report on stdout (including `--format json`) and `npm-utils:`
 errors are never affected, so piping stdout stays clean either way.
