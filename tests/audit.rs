@@ -244,6 +244,25 @@ mod cli {
         assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
     }
 
+    /// A quoted `~` reaches the CLI verbatim (the shell only expands unquoted tildes); audit
+    /// expands it against $HOME instead of probing a literal `~` path.
+    #[test]
+    fn tilde_source_expands_against_home() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(
+            dir.path(),
+            r#"{ "": { "name": "demo", "version": "1.0.0" } }"#,
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_npm-utils"))
+            .arg("audit")
+            .arg("~")
+            .env("HOME", dir.path())
+            .output()
+            .expect("spawn npm-utils audit");
+        assert_eq!(out.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
     /// A directory with neither a lockfile nor a manifest is a real error: nonzero exit with an
     /// `npm-utils:` message naming both candidates.
     #[test]
