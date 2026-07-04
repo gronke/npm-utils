@@ -16,7 +16,7 @@ include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 # The `npm-utils` / `cargo-npm-utils` command-line tool (pure-Rust `npm install` / `ci` / `add` /
 # `init` / `upgrade`). Opt-in so library consumers never pull `clap`: install the CLI with
 # `cargo install npm-utils --features cli`.
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:indicatif"]
 
 [dependencies]
 ureq = { version = "3.0", features = ["rustls", "platform-verifier"], default-features = false }
@@ -40,6 +40,10 @@ time = { version = "0.3", default-features = false, features = ["std", "formatti
 # CLI only (feature `cli`); optional, so a default library build skips it. clap and its deps build
 # under the crate MSRV (1.88), which is set by `time`, not clap.
 clap = { version = "4.5", features = ["derive"], optional = true }
+# Live multi-task progress rendering for the CLI's `--progress` (`cli::progress`). Optional and
+# cli-gated so library builds stay terminal-crate-free; `unicode-width` keeps column accounting
+# correct for wide characters. MSRV 1.85, under the crate's 1.88.
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width"], optional = true }
 
 # The CLI ships as two binaries from this one crate: `npm-utils <verb>` and, via cargo's
 # `cargo-<name>` convention, `cargo npm-utils <verb>`. `cargo install npm-utils --features cli`
@@ -56,6 +60,9 @@ required-features = ["cli"]
 
 [dev-dependencies]
 tempfile = "3"
+# `InMemoryTerm` render assertions for `cli::progress` unit tests. A dev-dep builds only for test
+# targets, so the vt100 parser it pulls never reaches release or MSRV builds.
+indicatif = { version = "0.18.6", features = ["in_memory", "unicode-width"] }
 
 [workspace]
 members = ["examples/date-converter"]

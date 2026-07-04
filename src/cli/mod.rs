@@ -3,8 +3,9 @@
 //! Pure-Rust npm verbs over the crate's primitives — it mirrors npm's vocabulary for the subset it
 //! supports and is deliberately **not** a full npm drop-in. Each verb lives in its own submodule;
 //! the shared helpers they lean on (manifest read/write, the lock+install `sync` that `add` and
-//! `upgrade` both run, install reporting) live in the `common` submodule, and the stderr status
-//! reporting behind the global `-q`/`--quiet` lives in `progress`.
+//! `upgrade` both run, install reporting) live in the `common` submodule, and the stderr progress
+//! rendering behind the global `--progress` (with `-q`/`--quiet` as its `none` shorthand) lives
+//! in `progress`.
 //!
 //! - `install` — record any given package sources (`name` / `name@range` / `name=range`) in
 //!   `package.json`, then resolve its `dependencies`, write `package-lock.json`, and install
@@ -66,9 +67,8 @@ struct Cli {
     /// Disable download timeouts entirely (no per-fetch or connect bound)
     #[arg(long, global = true)]
     no_timeout: bool,
-    /// Suppress status lines on stderr (reports on stdout and npm-utils: error messages still print)
-    #[arg(short = 'q', long, global = true)]
-    quiet: bool,
+    #[command(flatten)]
+    display: progress::DisplayOptions,
     #[command(subcommand)]
     command: Command,
 }
@@ -245,7 +245,10 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
         cli.timeout,
         cli.no_timeout,
     ));
-    let quiet = cli.quiet;
+    // Build the renderer once and reroute the library's warnings through it before any work
+    // begins — a live region must never be torn by a raw eprintln (even from worker threads).
+    let progress = progress::Progress::new(&cli.display);
+    progress.install_warn_sink();
     match cli.command {
         Command::Install {
             sources,
@@ -294,7 +297,7 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             sources.as_deref(),
             registry.as_deref(),
             allow_incomplete,
-            &progress::Progress::new(quiet),
+            &progress,
         ),
     }
 }
@@ -438,9 +441,48 @@ mod tests {
         assert!(Cli::try_parse_from(osv(&["npm-utils", "audit", "lit=^3", "--quiet"])).is_ok());
         assert!(Cli::try_parse_from(osv(&["npm-utils", "install", "-q"])).is_ok());
         // The flag actually lands, and defaults to off.
-        let quiet = |args: &[&str]| Cli::try_parse_from(osv(args)).unwrap().quiet;
+        let quiet = |args: &[&str]| Cli::try_parse_from(osv(args)).unwrap().display.quiet;
         assert!(quiet(&["npm-utils", "-q", "audit"]));
         assert!(!quiet(&["npm-utils", "audit"]));
+    }
+
+    #[test]
+    fn cli_accepts_global_progress_flag() {
+        use progress::ProgressMode;
+        let mode = |args: &[&str]| Cli::try_parse_from(osv(args)).unwrap().display.progress;
+        // Global: accepted before or after the verb; defaults to auto.
+        assert_eq!(mode(&["npm-utils", "audit"]), ProgressMode::Auto);
+        assert_eq!(
+            mode(&["npm-utils", "--progress", "verbose", "ci", "/tmp/x"]),
+            ProgressMode::Verbose
+        );
+        assert_eq!(
+            mode(&["npm-utils", "install", "--progress=none"]),
+            ProgressMode::Off
+        );
+        // The user-facing aliases: 1/yes/true → on, 0/off/false/no → none.
+        for on in ["on", "1", "yes", "true"] {
+            assert_eq!(
+                mode(&["npm-utils", "audit", "--progress", on]),
+                ProgressMode::On
+            );
+        }
+        for off in ["none", "0", "off", "false", "no"] {
+            assert_eq!(
+                mode(&["npm-utils", "audit", "--progress", off]),
+                ProgressMode::Off
+            );
+        }
+        // An unknown mode is a parse error.
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "audit", "--progress", "loud"])).is_err());
+        // `-q` alone is fine — a clap default value never participates in a conflict (the
+        // validator only considers explicitly provided args). An explicit --progress on the
+        // same side of the verb as -q errors; split across the verb boundary, clap's
+        // global-arg propagation doesn't connect the two and quiet wins in the resolver.
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "-q", "audit"])).is_ok());
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "-q", "--progress=on", "audit"])).is_err());
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "audit", "-q", "--progress=on"])).is_err());
+        assert!(Cli::try_parse_from(osv(&["npm-utils", "--progress=none", "audit", "-q"])).is_ok());
     }
 
     #[test]

@@ -1,227 +1,686 @@
-//! Stderr status reporting for long-running verbs, behind the global `-q`/`--quiet`.
+//! Stderr progress rendering for long-running verbs: named tasks, drawn per the global
+//! `--progress` mode.
 //!
-//! Status lines are *chatter*, not results: they go to stderr, never stdout (reports stay
-//! machine-consumable), never carry the `npm-utils:` error prefix (that marker is reserved for
-//! errors and warnings, which `--quiet` never suppresses), and vanish under `--quiet`. A TTY gets
-//! a live in-place line for counted phases; piped/CI stderr gets plain begin/completion lines.
-//! Rust's `Stderr` is unbuffered, so every `eprint!` reaches the terminal immediately — no
-//! flushing needed.
+//! Status output is *chatter*, not results: it goes to stderr, never stdout (reports stay
+//! machine-consumable), and never carries the `npm-utils:` prefix — that marker is reserved for
+//! warnings and errors, which print in **every** mode. The CLI routes the library's warnings
+//! through [`Progress::install_warn_sink`] so they land above a live region instead of tearing
+//! it. The modes:
+//!
+//! - `auto` (default): a live two-line block per task on a terminal; plain begin/finish line
+//!   pairs when stderr is piped.
+//! - `on` (`1`/`yes`/`true`): the live rendering even when piped (ANSI into the pipe).
+//! - `verbose`: one terminated line per event — begin, each item, finish — for logfiles.
+//! - `none` (`0`/`off`/`false`/`no`): nothing; `-q`/`--quiet` is its shorthand.
+//!
+//! A live task renders as `[name] (x/y) title` over one indented detail line, via a single
+//! indicatif `ProgressBar` with a newline template (a third info line — rates, sizes — is
+//! deliberately future scope). The block height is fixed and only `{wide_msg}` carries
+//! unbounded text: indicatif's row accounting assumes no soft wrap, so the header stays short
+//! and the detail line truncates to the terminal width.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Where a phase's lines go: nowhere (`--quiet`), plain terminated lines (piped stderr, and all
-/// [`Progress::step`] phases), or a live `\r`-rewritten TTY line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sink {
+use clap::{Args, ValueEnum};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
+
+/// `--progress` values. The variant is `Off` but surfaces as `none` on the CLI, so it never
+/// collides with `Option::None` at call sites; the numeric/boolean spellings are hidden aliases.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub(super) enum ProgressMode {
+    /// Live rendering on a terminal, plain line pairs when piped
+    Auto,
+    /// Live rendering even when stderr is piped
+    #[value(alias = "1", alias = "yes", alias = "true")]
+    On,
+    /// One terminated line per event — logfile-friendly, no control characters
+    Verbose,
+    /// No status output (npm-utils: warnings and errors still print)
+    #[value(
+        name = "none",
+        alias = "0",
+        alias = "off",
+        alias = "false",
+        alias = "no"
+    )]
     Off,
-    Plain,
-    Tty,
 }
 
-/// The stderr status reporter — constructed once per invocation from the `--quiet` flag; hands
-/// out [`Phase`]s. Every method is a no-op when quiet.
+/// The global stderr-status flags, flattened into the top-level `Cli` (the `LicenseOpts`
+/// pattern).
+#[derive(Args)]
+pub(super) struct DisplayOptions {
+    /// Progress rendering on stderr: auto (live on a terminal), on (live even piped), verbose (a line per event), none
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "MODE",
+        default_value = "auto"
+    )]
+    pub(super) progress: ProgressMode,
+    /// Suppress status lines on stderr — shorthand for --progress=none (reports on stdout and npm-utils: messages still print)
+    #[arg(short = 'q', long, global = true, conflicts_with = "progress")]
+    pub(super) quiet: bool,
+}
+
+impl DisplayOptions {
+    /// The rendering strategy these flags select against the actual stderr.
+    pub(super) fn rendering(&self) -> Rendering {
+        resolve_rendering(self.progress, self.quiet, std::io::stderr().is_terminal())
+    }
+}
+
+/// The resolved rendering strategy — a pure function of the flags and stderr's TTY-ness
+/// ([`resolve_rendering`]), so the whole selection matrix is unit-testable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Rendering {
+    Live { forced: bool },
+    Plain,
+    Verbose,
+    Off,
+}
+
+fn resolve_rendering(mode: ProgressMode, quiet: bool, stderr_is_tty: bool) -> Rendering {
+    // `-q` conflicts with an explicit `--progress` when clap sees both on the same side of the
+    // verb; split across the verb boundary the global-arg propagation doesn't connect them, so
+    // quiet winning unconditionally keeps the shorthand deterministic either way.
+    if quiet {
+        return Rendering::Off;
+    }
+    match mode {
+        ProgressMode::Auto if stderr_is_tty => Rendering::Live { forced: false },
+        ProgressMode::Auto => Rendering::Plain,
+        ProgressMode::On => Rendering::Live { forced: true },
+        ProgressMode::Verbose => Rendering::Verbose,
+        ProgressMode::Off => Rendering::Off,
+    }
+}
+
+/// The stderr progress reporter — constructed once per invocation from [`DisplayOptions`];
+/// hands out named [`TaskStatus`]es and (via [`Progress::install_warn_sink`]) keeps the
+/// library's `npm-utils:` warnings from corrupting a live region.
 pub(super) struct Progress {
-    quiet: bool,
-    tty: bool,
+    inner: Arc<Backend>,
+}
+
+/// Where task events go. `Text` covers both plain (begin/finish pairs) and verbose (a line per
+/// item); its writes go through one Mutex so task lines and worker-thread warnings never tear.
+/// The boxed writer is stderr in production and an injectable buffer in unit tests. Failed
+/// writes are dropped rather than panicking (a closed stderr shouldn't kill an install —
+/// a deliberate softening of `eprintln!`).
+enum Backend {
+    Live(MultiProgress),
+    Text {
+        verbose: bool,
+        out: Mutex<Box<dyn Write + Send>>,
+    },
+    Off,
 }
 
 impl Progress {
-    /// Capture `--quiet` and whether stderr is a terminal.
-    pub(super) fn new(quiet: bool) -> Progress {
-        Progress {
-            quiet,
-            tty: std::io::stderr().is_terminal(),
-        }
+    pub(super) fn new(opts: &DisplayOptions) -> Progress {
+        Progress::from_rendering(opts.rendering())
     }
 
-    /// Begin a phase whose progress arrives via [`Phase::tick`] (the resolution walk). On a TTY
-    /// the line is rewritten in place until [`Phase::finish`] completes it; elsewhere a begin
-    /// line prints now and a completion line at finish.
-    pub(super) fn counted(&self, label: impl Into<String>) -> Phase {
-        let sink = match (self.quiet, self.tty) {
-            (true, _) => Sink::Off,
-            (false, true) => Sink::Tty,
-            (false, false) => Sink::Plain,
-        };
-        Phase::begin(sink, label.into())
-    }
-
-    /// Begin a phase reported as two terminated lines, begin and completion (the advisory-source
-    /// queries). It never holds an unterminated line — safe to interleave with warnings the
-    /// library emits mid-phase (download retries, OSV record hydration), even on a TTY.
-    pub(super) fn step(&self, label: impl Into<String>) -> Phase {
-        let sink = if self.quiet { Sink::Off } else { Sink::Plain };
-        Phase::begin(sink, label.into())
-    }
-}
-
-/// One in-flight phase: created by [`Progress::counted`] / [`Progress::step`], ended by
-/// [`Phase::finish`]. Dropping an unfinished phase (an error propagating mid-phase) terminates an
-/// open TTY line with a bare newline, so the `npm-utils:` error that follows starts at column 0.
-pub(super) struct Phase {
-    sink: Sink,
-    label: String,
-    started: Instant,
-    /// Whether a TTY line is open (printed without a trailing newline).
-    open: bool,
-    /// Width of the previous TTY render — a `\r` rewrite only overwrites what it prints, so a
-    /// shorter render pads up to this with spaces ([`pad_to_previous`]).
-    last_width: usize,
-}
-
-impl Phase {
-    fn begin(sink: Sink, label: String) -> Phase {
-        let opening = begin_line(&label);
-        match sink {
-            Sink::Off => {}
-            Sink::Plain => eprintln!("{opening}"),
-            Sink::Tty => eprint!("{opening}"),
-        }
-        Phase {
-            sink,
-            started: Instant::now(),
-            open: sink == Sink::Tty,
-            // Clamped so a pathological >TICK_WIDTH label can never force an over-wide tick pad.
-            last_width: match sink {
-                Sink::Tty => opening.chars().count().min(TICK_WIDTH),
-                _ => 0,
+    fn from_rendering(rendering: Rendering) -> Progress {
+        let backend = match rendering {
+            // MultiProgress::new draws to stderr at indicatif's default refresh rate.
+            Rendering::Live { forced: false } => Backend::Live(MultiProgress::new()),
+            // A `TermLike` target bypasses indicatif's user-attended auto-hide — that *is* the
+            // force — but has no default rate limit, so cap it explicitly.
+            Rendering::Live { forced: true } => Backend::Live(MultiProgress::with_draw_target(
+                ProgressDrawTarget::term_like_with_hz(Box::new(ForcedStderr), 20),
+            )),
+            Rendering::Plain => Backend::Text {
+                verbose: false,
+                out: Mutex::new(Box::new(std::io::stderr())),
             },
-            label,
+            Rendering::Verbose => Backend::Text {
+                verbose: true,
+                out: Mutex::new(Box::new(std::io::stderr())),
+            },
+            Rendering::Off => Backend::Off,
+        };
+        Progress {
+            inner: Arc::new(backend),
         }
     }
 
-    /// Update the live line with `detail` (e.g. `"245 lit-html@3.3.3"`) — counted phases on a
-    /// TTY; silent elsewhere.
-    pub(super) fn tick(&mut self, detail: &str) {
-        if self.sink == Sink::Tty {
-            let line = tick_line(&self.label, detail);
-            eprint!("\r{}", pad_to_previous(&line, &mut self.last_width));
+    /// Start a named task: `name` is the short bracket tag (`resolve`, `install`, an advisory
+    /// source), `title` the human phase label. Live mode adds the two-line block immediately;
+    /// text modes print the begin line.
+    pub(super) fn task(&self, name: &str, title: impl Into<String>) -> TaskStatus {
+        let title = title.into();
+        let bar = match &*self.inner {
+            Backend::Live(mp) => {
+                let bar = mp.add(
+                    ProgressBar::no_length()
+                        .with_style(style_bare(name))
+                        .with_prefix(title.clone()),
+                );
+                // Force the initial draw — the block should appear before the first event.
+                bar.tick();
+                Some(bar)
+            }
+            Backend::Text { out, .. } => {
+                let _ = writeln!(
+                    out.lock().expect("progress sink poisoned"),
+                    "{}",
+                    begin_line(name, &title)
+                );
+                None
+            }
+            Backend::Off => None,
+        };
+        TaskStatus {
+            name: name.to_string(),
+            title,
+            started: Instant::now(),
+            finished: AtomicBool::new(false),
+            counts: Mutex::new(Counts {
+                pos: 0,
+                total: None,
+            }),
+            inner: Arc::clone(&self.inner),
+            bar,
+            stage: AtomicU8::new(0),
         }
     }
 
-    /// Complete the phase: print `{label} ... {summary} ({secs}s)` and release the terminal line.
-    pub(super) fn finish(mut self, summary: &str) {
-        let line = finish_line(&self.label, summary, self.started.elapsed().as_secs_f64());
-        match self.sink {
-            Sink::Off => {}
-            Sink::Plain => eprintln!("{line}"),
-            Sink::Tty => eprint!("\r{}\n", pad_to_previous(&line, &mut self.last_width)),
-        }
-        self.open = false;
+    /// Route the library's `npm-utils:` warnings through this renderer (process-wide; the first
+    /// caller wins). Live mode prints them as permanent lines above the region.
+    pub(super) fn install_warn_sink(&self) {
+        let inner = Arc::clone(&self.inner);
+        crate::warn::set_warn_sink(Box::new(move |msg| inner.warn_msg(msg)));
     }
 }
 
-impl Drop for Phase {
+impl Backend {
+    fn warn_msg(&self, msg: &str) {
+        match self {
+            Backend::Live(mp) => {
+                let _ = mp.println(format!("npm-utils: {msg}"));
+            }
+            Backend::Text { out, .. } => {
+                let _ = writeln!(
+                    out.lock().expect("progress sink poisoned"),
+                    "npm-utils: {msg}"
+                );
+            }
+            // Warnings always print — `--progress=none` silences status, never warnings.
+            Backend::Off => eprintln!("npm-utils: {msg}"),
+        }
+    }
+}
+
+/// One named background task. Methods take `&self` (interior mutability) and the type is `Sync`
+/// so resolver worker threads can tick a borrowed handle; it is deliberately not `Clone` —
+/// single owner, threads borrow. Ended by [`TaskStatus::finish`] / [`TaskStatus::fail`];
+/// dropping an unfinished task (an error propagating mid-phase) clears a live block without a
+/// permanent line, so the `npm-utils:` error that follows starts at column 0 with no residue.
+pub(super) struct TaskStatus {
+    name: String,
+    title: String,
+    started: Instant,
+    finished: AtomicBool,
+    counts: Mutex<Counts>,
+    inner: Arc<Backend>,
+    /// The live block; `None` in the text/off modes.
+    bar: Option<ProgressBar>,
+    /// Live header stage: 0 bare, 1 counted `(pos)`, 2 totaled `(pos/len)`. Monotonic — a task
+    /// that learns its total never falls back, and a count-less task shows no `(0)` noise.
+    stage: AtomicU8,
+}
+
+struct Counts {
+    pos: u64,
+    total: Option<u64>,
+}
+
+impl TaskStatus {
+    /// Declare the item total, upgrading the header to `(pos/len)`. `{len}` enters the live
+    /// template only here, so an unset length is never rendered.
+    #[allow(dead_code)] // wired by the install-family tickers in a follow-up commit
+    pub(super) fn set_total(&self, total: u64) {
+        self.counts.lock().expect("progress state poisoned").total = Some(total);
+        if let Some(bar) = &self.bar {
+            self.stage.store(2, Ordering::SeqCst);
+            bar.set_style(style_totaled(&self.name));
+            bar.set_length(total);
+            // A style/length change alone doesn't mark the draw state dirty — force the redraw
+            // so the `(pos/len)` header appears before the next event.
+            bar.tick();
+        }
+    }
+
+    /// Count one completed item. Live: bump the counter and show the item on the detail line;
+    /// verbose: one terminated line per item; plain: counted silently (begin/finish pairs only).
+    pub(super) fn inc(&self, item: &str) {
+        let (pos, total) = {
+            let mut counts = self.counts.lock().expect("progress state poisoned");
+            counts.pos += 1;
+            (counts.pos, counts.total)
+        };
+        match &*self.inner {
+            Backend::Live(_) => {
+                if let Some(bar) = &self.bar {
+                    // The first count switches the bare header to `(pos)` — unless a total
+                    // already upgraded it to `(pos/len)` (the stage is monotonic).
+                    if self
+                        .stage
+                        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        bar.set_style(style_counted(&self.name));
+                    }
+                    bar.set_position(pos);
+                    bar.set_message(item.to_string());
+                }
+            }
+            Backend::Text { verbose: true, out } => {
+                let _ = writeln!(
+                    out.lock().expect("progress sink poisoned"),
+                    "{}",
+                    item_line(&self.name, pos, total, item)
+                );
+            }
+            Backend::Text { .. } | Backend::Off => {}
+        }
+    }
+
+    /// Update the live detail line with transient state (in-flight fetches, the current file).
+    /// Text modes ignore it — transient state is not an item, and logs get one line per item.
+    #[allow(dead_code)] // wired by the resolver's in-flight ticker in a follow-up commit
+    pub(super) fn detail(&self, text: &str) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(text.to_string());
+        }
+    }
+
+    /// Items counted so far.
+    #[allow(dead_code)] // wired by the install-family tickers in a follow-up commit
+    pub(super) fn count(&self) -> u64 {
+        self.counts.lock().expect("progress state poisoned").pos
+    }
+
+    /// Complete the task: print `[name] title ... summary (secs)` as a permanent line and, in
+    /// live mode, clear the block.
+    pub(super) fn finish(self, summary: &str) {
+        self.complete(summary);
+    }
+
+    /// Semantic alias of [`TaskStatus::finish`] for failure summaries — identical rendering
+    /// today, a styling seam for later.
+    pub(super) fn fail(self, summary: &str) {
+        self.complete(summary);
+    }
+
+    fn complete(&self, summary: &str) {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let line = finish_line(
+            &self.name,
+            &self.title,
+            summary,
+            self.started.elapsed().as_secs_f64(),
+        );
+        match &*self.inner {
+            Backend::Live(mp) => {
+                // Order matters: print the permanent line above the still-registered block,
+                // then clear the block's rows and release the bar.
+                let _ = mp.println(line);
+                if let Some(bar) = &self.bar {
+                    bar.finish_and_clear();
+                    mp.remove(bar);
+                }
+            }
+            Backend::Text { out, .. } => {
+                let _ = writeln!(out.lock().expect("progress sink poisoned"), "{line}");
+            }
+            Backend::Off => {}
+        }
+    }
+}
+
+impl Drop for TaskStatus {
     fn drop(&mut self) {
-        if self.open {
-            eprintln!();
+        if !self.finished.swap(true, Ordering::SeqCst) {
+            // Unfinished (an error is propagating): clear a live block, print nothing. Text
+            // begin lines are already terminated, so there is nothing to release.
+            if let (Some(bar), Backend::Live(mp)) = (&self.bar, &*self.inner) {
+                bar.finish_and_clear();
+                mp.remove(bar);
+            }
         }
     }
 }
 
-/// Max width of a transient TTY tick render — a `\r` rewrite of a line wider than the terminal
-/// would land on the wrong row; 80 columns is the conservative floor. The terminated begin and
-/// finish lines are uncapped (they may wrap, harmlessly).
-const TICK_WIDTH: usize = 80;
+/// Raw-ANSI stderr for `--progress=on`: a `TermLike` draw target bypasses indicatif's
+/// user-attended auto-hide, so a piped consumer still receives the live control sequences.
+/// There is no real terminal to measure, so the width is the same conservative 80-column floor
+/// the old renderer used.
+#[derive(Debug)]
+struct ForcedStderr;
 
-/// `{label} ...` — the phase-begin text.
-fn begin_line(label: &str) -> String {
-    format!("{label} ...")
-}
+const FORCED_WIDTH: u16 = 80;
 
-/// `{label} ... {summary} ({secs:.1}s)` — the completion text. Repeating the label keeps piped
-/// log lines self-contained and greppable.
-fn finish_line(label: &str, summary: &str, secs: f64) -> String {
-    format!("{label} ... {summary} ({secs:.1}s)")
-}
-
-/// `{label} ... {detail}` capped to [`TICK_WIDTH`] characters (char-boundary safe) — the
-/// transient TTY render. Renders shrink and grow as package names change, so the rewrite pads
-/// against the previous width ([`pad_to_previous`]) rather than relying on monotonic length.
-fn tick_line(label: &str, detail: &str) -> String {
-    let line = format!("{label} ... {detail}");
-    if line.chars().count() > TICK_WIDTH {
-        line.chars().take(TICK_WIDTH).collect()
-    } else {
-        line
+impl TermLike for ForcedStderr {
+    fn width(&self) -> u16 {
+        FORCED_WIDTH
+    }
+    fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
+        if n > 0 {
+            write!(std::io::stderr(), "\x1b[{n}A")
+        } else {
+            Ok(())
+        }
+    }
+    fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
+        if n > 0 {
+            write!(std::io::stderr(), "\x1b[{n}B")
+        } else {
+            Ok(())
+        }
+    }
+    fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
+        if n > 0 {
+            write!(std::io::stderr(), "\x1b[{n}C")
+        } else {
+            Ok(())
+        }
+    }
+    fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
+        if n > 0 {
+            write!(std::io::stderr(), "\x1b[{n}D")
+        } else {
+            Ok(())
+        }
+    }
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        let mut err = std::io::stderr();
+        err.write_all(s.as_bytes())?;
+        err.write_all(b"\n")
+    }
+    fn write_str(&self, s: &str) -> std::io::Result<()> {
+        std::io::stderr().write_all(s.as_bytes())
+    }
+    fn clear_line(&self) -> std::io::Result<()> {
+        write!(std::io::stderr(), "\r\x1b[2K")
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        std::io::stderr().flush()
     }
 }
 
-/// Pad `line` with trailing spaces up to the previous render's width — a `\r` rewrite only
-/// overwrites what it prints, so a shorter render would leave the old line's tail on screen —
-/// then record the new *unpadded* width (anything beyond it is already spaces from this pad).
-/// Tick renders are capped at [`TICK_WIDTH`] and the tracker starts clamped to it, so a padded
-/// tick never exceeds [`TICK_WIDTH`]; the newline-terminated finish line may, wrapping once,
-/// harmlessly.
-fn pad_to_previous(line: &str, last_width: &mut usize) -> String {
-    let width = line.chars().count();
-    let padded = if width < *last_width {
-        format!("{line}{}", " ".repeat(*last_width - width))
-    } else {
-        line.to_string()
-    };
-    *last_width = width;
-    padded
+/// The live templates a task's header moves through. Exactly one `\n` (a fixed two-line block)
+/// and only `{wide_msg}` may carry unbounded text — indicatif's row accounting assumes no soft
+/// wrap — so titles stay well under the 80-column floor. Task names are crate literals; the
+/// templates are static by construction.
+fn style_bare(name: &str) -> ProgressStyle {
+    style(&format!("[{name}] {{prefix}}\n  {{wide_msg}}"))
+}
+
+fn style_counted(name: &str) -> ProgressStyle {
+    style(&format!("[{name}] ({{pos}}) {{prefix}}\n  {{wide_msg}}"))
+}
+
+fn style_totaled(name: &str) -> ProgressStyle {
+    style(&format!(
+        "[{name}] ({{pos}}/{{len}}) {{prefix}}\n  {{wide_msg}}"
+    ))
+}
+
+fn style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template).expect("static progress template")
+}
+
+/// `[{name}] {title} ...` — the begin text (plain/verbose modes).
+fn begin_line(name: &str, title: &str) -> String {
+    format!("[{name}] {title} ...")
+}
+
+/// `[{name}] ({pos}/{total}) {item}` — one verbose item line; `({pos})` while the total is
+/// unknown.
+fn item_line(name: &str, pos: u64, total: Option<u64>, item: &str) -> String {
+    match total {
+        Some(total) => format!("[{name}] ({pos}/{total}) {item}"),
+        None => format!("[{name}] ({pos}) {item}"),
+    }
+}
+
+/// `[{name}] {title} ... {summary} ({secs:.1}s)` — the completion text in every mode. Repeating
+/// the title keeps piped log lines self-contained and greppable.
+fn finish_line(name: &str, title: &str, summary: &str, secs: f64) -> String {
+    format!("[{name}] {title} ... {summary} ({secs:.1}s)")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indicatif::InMemoryTerm;
+
+    impl Progress {
+        /// A text backend writing into a shared buffer instead of stderr.
+        fn text_capture(verbose: bool) -> (Progress, Arc<Mutex<Vec<u8>>>) {
+            struct Capture(Arc<Mutex<Vec<u8>>>);
+            impl Write for Capture {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let progress = Progress {
+                inner: Arc::new(Backend::Text {
+                    verbose,
+                    out: Mutex::new(Box::new(Capture(Arc::clone(&buf)))),
+                }),
+            };
+            (progress, buf)
+        }
+
+        /// A live backend drawing onto an in-memory terminal (no rate limit — every state
+        /// change draws immediately, so assertions are deterministic).
+        fn live_on(term: InMemoryTerm) -> Progress {
+            Progress {
+                inner: Arc::new(Backend::Live(MultiProgress::with_draw_target(
+                    ProgressDrawTarget::term_like(Box::new(term)),
+                ))),
+            }
+        }
+    }
+
+    fn captured(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
 
     #[test]
-    fn finish_line_formats_summary_and_elapsed() {
+    fn mode_resolution_matrix() {
+        use ProgressMode::*;
+        // auto splits on TTY-ness; on forces live either way; verbose/none ignore the terminal.
         assert_eq!(
-            finish_line("querying npm advisories", "169 advisories", 1.23),
-            "querying npm advisories ... 169 advisories (1.2s)"
+            resolve_rendering(Auto, false, true),
+            Rendering::Live { forced: false }
+        );
+        assert_eq!(resolve_rendering(Auto, false, false), Rendering::Plain);
+        assert_eq!(
+            resolve_rendering(On, false, true),
+            Rendering::Live { forced: true }
         );
         assert_eq!(
-            begin_line("resolving dependency tree from registry.npmjs.org"),
-            "resolving dependency tree from registry.npmjs.org ..."
+            resolve_rendering(On, false, false),
+            Rendering::Live { forced: true }
+        );
+        assert_eq!(resolve_rendering(Verbose, false, true), Rendering::Verbose);
+        assert_eq!(resolve_rendering(Verbose, false, false), Rendering::Verbose);
+        assert_eq!(resolve_rendering(Off, false, true), Rendering::Off);
+        // -q always means off — including over an explicit mode that slipped past clap's
+        // same-level conflict by sitting on the other side of the verb.
+        assert_eq!(resolve_rendering(Auto, true, true), Rendering::Off);
+        assert_eq!(resolve_rendering(Auto, true, false), Rendering::Off);
+        assert_eq!(resolve_rendering(On, true, false), Rendering::Off);
+    }
+
+    #[test]
+    fn begin_item_finish_lines_format() {
+        assert_eq!(
+            begin_line("npm", "querying npm advisories"),
+            "[npm] querying npm advisories ..."
+        );
+        assert_eq!(
+            item_line("install", 3, Some(12), "debug@4.4.0"),
+            "[install] (3/12) debug@4.4.0"
+        );
+        assert_eq!(
+            item_line("resolve", 37, None, "lodash@4.17.21"),
+            "[resolve] (37) lodash@4.17.21"
+        );
+        assert_eq!(
+            finish_line("npm", "querying npm advisories", "169 advisories", 1.23),
+            "[npm] querying npm advisories ... 169 advisories (1.2s)"
         );
     }
 
     #[test]
-    fn tick_line_caps_width_on_a_char_boundary() {
-        assert_eq!(
-            tick_line("resolving", "37 lodash@4.17.21"),
-            "resolving ... 37 lodash@4.17.21"
+    fn plain_task_prints_begin_and_finish_pair_only() {
+        let (progress, buf) = Progress::text_capture(false);
+        let task = progress.task("install", "installing packages");
+        task.set_total(2);
+        task.inc("a@1.0.0");
+        task.inc("b@2.0.0");
+        task.detail("transient state");
+        assert_eq!(task.count(), 2);
+        task.finish("2 packages");
+
+        let out = captured(&buf);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines[0], "[install] installing packages ...");
+        assert!(
+            lines[1].starts_with("[install] installing packages ... 2 packages ("),
+            "{out}"
         );
-        // A label pushing the render past the cap — with a multibyte char near the boundary —
-        // truncates to exactly TICK_WIDTH chars without splitting a codepoint.
-        let wide = format!("{}é", "x".repeat(90));
-        let capped = tick_line(&wide, "12345");
-        assert_eq!(capped.chars().count(), TICK_WIDTH);
-        assert!(capped.starts_with("xxx"));
     }
 
     #[test]
-    fn padding_covers_a_shrinking_rewrite() {
-        // A shorter render is padded up to the previous width so no stale tail survives the
-        // `\r` rewrite; the tracker then records the *unpadded* width.
-        let mut last_width = 33;
-        let padded = pad_to_previous(&"x".repeat(20), &mut last_width);
-        assert_eq!(padded, format!("{}{}", "x".repeat(20), " ".repeat(13)));
-        assert_eq!(last_width, 20);
-        // A longer render needs no pad.
-        let unpadded = pad_to_previous(&"y".repeat(25), &mut last_width);
-        assert_eq!(unpadded, "y".repeat(25));
-        assert_eq!(last_width, 25);
+    fn verbose_task_prints_one_line_per_item() {
+        let (progress, buf) = Progress::text_capture(true);
+        let task = progress.task("install", "installing packages");
+        task.set_total(2);
+        task.inc("a@1.0.0");
+        task.detail("transient state"); // not an item — no line
+        task.inc("b@2.0.0");
+        task.finish("2 packages");
+
+        let out = captured(&buf);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "{out}");
+        assert_eq!(lines[0], "[install] installing packages ...");
+        assert_eq!(lines[1], "[install] (1/2) a@1.0.0");
+        assert_eq!(lines[2], "[install] (2/2) b@2.0.0");
+        assert!(lines[3].starts_with("[install] installing packages ... 2 packages ("));
     }
 
     #[test]
-    fn quiet_phases_are_inert_including_drop_without_finish() {
-        // Quiet: full lifecycle plus a dropped-unfinished phase must not print or panic (cargo
-        // captures stderr; this is a state-machine smoke test).
-        let progress = Progress {
-            quiet: true,
-            tty: false,
-        };
-        let mut counted = progress.counted("resolving");
-        counted.tick("1 a@1.0.0");
-        counted.tick("2 b@2.0.0");
-        counted.finish("2 packages");
-        let step = progress.step("querying npm advisories");
-        drop(step); // unfinished — the Drop backstop must be a no-op off-TTY
+    fn warn_serializes_with_text_lines() {
+        // Warnings share the text sink's Mutex, so a worker-thread warning can never tear a
+        // task line; they keep the npm-utils: prefix in every mode.
+        let (progress, buf) = Progress::text_capture(false);
+        let task = progress.task("resolve", "resolving dependency tree");
+        progress.inner.warn_msg("something failed; retrying");
+        task.finish("1 package");
+
+        let lines: Vec<String> = captured(&buf).lines().map(str::to_string).collect();
+        assert_eq!(lines[1], "npm-utils: something failed; retrying");
+    }
+
+    #[test]
+    fn off_tasks_are_inert_including_drop_without_finish() {
+        // Off: full lifecycle plus a dropped-unfinished task must not print or panic (cargo
+        // captures stderr; this is a state-machine smoke test — counting still works).
+        let progress = Progress::from_rendering(Rendering::Off);
+        let task = progress.task("resolve", "resolving");
+        task.inc("a@1.0.0");
+        task.set_total(3);
+        task.detail("x");
+        assert_eq!(task.count(), 1);
+        task.finish("done");
+        let unfinished = progress.task("npm", "querying npm advisories");
+        drop(unfinished);
+    }
+
+    #[test]
+    fn live_task_renders_staged_headers() {
+        let term = InMemoryTerm::new(10, 80);
+        let progress = Progress::live_on(term.clone());
+        let task = progress.task("install", "installing packages");
+        assert!(
+            term.contents().contains("[install] installing packages"),
+            "{}",
+            term.contents()
+        );
+
+        // First count upgrades the bare header to `(1)`; the detail line names the item.
+        task.inc("a@1.0.0");
+        assert!(
+            term.contents()
+                .contains("[install] (1) installing packages"),
+            "{}",
+            term.contents()
+        );
+        assert!(term.contents().contains("  a@1.0.0"), "{}", term.contents());
+
+        // A learned total upgrades to `(1/3)`; a transient detail replaces the item text.
+        task.set_total(3);
+        assert!(
+            term.contents()
+                .contains("[install] (1/3) installing packages"),
+            "{}",
+            term.contents()
+        );
+        task.detail("fetching b, c");
+        assert!(
+            term.contents().contains("  fetching b, c"),
+            "{}",
+            term.contents()
+        );
+        task.finish("3 packages");
+    }
+
+    #[test]
+    fn live_finish_prints_permanent_line_and_clears_block() {
+        let term = InMemoryTerm::new(10, 80);
+        let progress = Progress::live_on(term.clone());
+        let task = progress.task("install", "installing packages");
+        task.set_total(3);
+        task.inc("a@1.0.0");
+        task.finish("3 packages");
+
+        let contents = term.contents();
+        assert!(
+            contents.contains("[install] installing packages ... 3 packages ("),
+            "{contents}"
+        );
+        // The live block is gone — no counter header or dangling detail line survives.
+        assert!(!contents.contains("(1/3)"), "{contents}");
+        assert!(!contents.contains("a@1.0.0"), "{contents}");
+    }
+
+    #[test]
+    fn live_drop_backstop_clears_without_a_permanent_line() {
+        let term = InMemoryTerm::new(10, 80);
+        let progress = Progress::live_on(term.clone());
+        let task = progress.task("resolve", "resolving dependency tree");
+        task.inc("a@1.0.0");
+        drop(task); // an error propagating mid-task
+        assert_eq!(term.contents().trim(), "", "{}", term.contents());
     }
 }

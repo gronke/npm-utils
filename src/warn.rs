@@ -14,7 +14,7 @@ static SINK: OnceLock<Sink> = OnceLock::new();
 /// in-process tests tolerate an already-installed sink. The sink receives the message *without*
 /// the `npm-utils: ` prefix and must expect calls from worker threads (download retries fire on
 /// the resolver's prefetch pool).
-#[allow(dead_code)] // the caller is the CLI renderer, which lands with `--progress`
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn set_warn_sink(sink: Sink) {
     let _ = SINK.set(sink);
 }

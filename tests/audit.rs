@@ -453,10 +453,10 @@ mod cli {
         assert_eq!(out.status.code(), Some(0), "--allow-incomplete → exit 0");
     }
 
-    /// Status lines land on stderr by default: the resolution phase for a manifest source and one
-    /// begin/done pair per advisory source (emitted even for an empty component set). Offline —
-    /// a zero-dep manifest resolves without network and empty components short-circuit the
-    /// sources' queries.
+    /// Status lines land on stderr by default: a `[resolve]` task for a manifest source and one
+    /// task per advisory source (emitted even for an empty component set). Offline — a zero-dep
+    /// manifest resolves without network and empty components short-circuit the sources'
+    /// queries. Piped stderr gets the plain renderer: terminated lines, no control bytes.
     #[test]
     fn status_lines_appear_on_stderr_by_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -464,11 +464,97 @@ mod cli {
         let out = audit(dir.path().join("package.json"), &[]);
         assert_eq!(out.status.code(), Some(0));
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("resolving dependency tree"), "{stderr}");
-        assert!(stderr.contains("querying npm advisories"), "{stderr}");
-        assert!(stderr.contains("querying osv advisories"), "{stderr}");
+        assert!(
+            stderr.contains("[resolve] resolving dependency tree"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("[npm] querying npm advisories"), "{stderr}");
+        assert!(stderr.contains("[osv] querying osv advisories"), "{stderr}");
+        assert!(
+            !stderr.contains('\x1b') && !stderr.contains('\r'),
+            "{stderr:?}"
+        );
         // The report itself stays on stdout, unchanged.
         assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
+    /// `--progress=none` silences status exactly like `-q` — and only status.
+    #[test]
+    fn progress_none_matches_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &["--progress=none"]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("resolving"), "{stderr}");
+        assert!(!stderr.contains("querying"), "{stderr}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
+    /// The piped default renders each task as exactly one begin/finish line pair — nothing
+    /// between, elapsed seconds on the finish.
+    #[test]
+    fn default_piped_status_is_plain_line_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &[]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let npm_lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("querying npm advisories"))
+            .collect();
+        assert_eq!(npm_lines.len(), 2, "{stderr}");
+        assert_eq!(npm_lines[0], "[npm] querying npm advisories ...");
+        assert!(npm_lines[1].contains("advisor"), "{stderr}");
+        assert!(npm_lines[1].ends_with("s)"), "{stderr}");
+    }
+
+    /// `--progress=verbose` stays line-terminated with zero control bytes (logfile-friendly).
+    #[test]
+    fn verbose_progress_is_line_terminated_without_control_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &["--progress=verbose"]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("[resolve] resolving dependency tree from registry.npmjs.org ..."),
+            "{stderr}"
+        );
+        assert!(stderr.contains("packages ("), "{stderr}");
+        assert!(
+            !stderr.contains('\x1b') && !stderr.contains('\r'),
+            "{stderr:?}"
+        );
+    }
+
+    /// `--progress=on` forces the live renderer even when stderr is piped: ANSI control bytes
+    /// arrive, and the permanent finish lines still land.
+    #[test]
+    fn forced_progress_emits_live_control_bytes_when_piped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &["--progress=on"]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains('\x1b'), "{stderr:?}");
+        assert!(
+            stderr.contains("[resolve] resolving dependency tree"),
+            "{stderr:?}"
+        );
+    }
+
+    /// `-q` plus an explicit `--progress` on the same side of the verb is a clap usage error.
+    #[test]
+    fn quiet_conflicts_with_explicit_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "{}");
+        let out = audit(dir.path().join("package.json"), &["-q", "--progress=on"]);
+        assert_eq!(out.status.code(), Some(2), "clap usage error exits 2");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--progress"), "{stderr}");
+        assert!(stderr.contains("--quiet"), "{stderr}");
     }
 
     /// `-q`/`--quiet` silences the status lines — and only them.
@@ -511,7 +597,7 @@ mod cli {
         assert_ne!(out.status.code(), Some(0));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("resolving dependency tree from localhost:1"),
+            stderr.contains("[resolve] resolving dependency tree from localhost:1"),
             "{stderr}"
         );
         assert!(stderr.contains("npm-utils:"), "{stderr}");
