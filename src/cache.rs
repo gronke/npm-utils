@@ -36,12 +36,12 @@ pub fn with_lock<F: FnOnce() -> R, R>(lock_path: &Path) -> impl FnOnce(F) -> R {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if lock_is_stale(&lock_path) {
-                        eprintln!(
-                            "npm-utils: lock at {} looks stale (file older than {}s) — \
+                        crate::warn::warn(&format!(
+                            "lock at {} looks stale (file older than {}s) — \
                              removing and continuing",
                             lock_path.display(),
                             STALE_LOCK.as_secs()
-                        );
+                        ));
                         let _ = fs::remove_file(&lock_path);
                         continue;
                     }

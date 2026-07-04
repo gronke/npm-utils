@@ -47,10 +47,10 @@ pub fn from_lockfile(
                 // npm ci treats a failed *optional* dependency as non-fatal: warn and skip it
                 // rather than aborting the whole install.
                 Err(e) if pkg.optional || pkg.dev_optional => {
-                    eprintln!(
-                        "npm-utils: optional dependency `{}` failed to install ({e}); skipping",
+                    crate::warn::warn(&format!(
+                        "optional dependency `{}` failed to install ({e}); skipping",
                         pkg.name
-                    );
+                    ));
                 }
                 Err(e) => return Err(e),
             }

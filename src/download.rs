@@ -127,10 +127,10 @@ pub fn fetch_with_accept(
         match try_fetch(&agent, url, accept) {
             Ok(body) => return Ok(body),
             Err(e) if attempt < attempts => {
-                eprintln!(
-                    "npm-utils: download attempt {attempt}/{attempts} failed for {url}: {e}; \
+                crate::warn::warn(&format!(
+                    "download attempt {attempt}/{attempts} failed for {url}: {e}; \
                      retrying in 500ms"
-                );
+                ));
                 std::thread::sleep(Duration::from_millis(500));
             }
             Err(e) => return Err(e),

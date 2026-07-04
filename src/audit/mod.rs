@@ -251,10 +251,10 @@ pub(crate) fn run_audit_observed(
             }
             Err(e) => {
                 on_event(SourceEvent::Failed);
-                eprintln!(
-                    "npm-utils: {} advisory source failed: {e}; audit results may be incomplete",
+                crate::warn::warn(&format!(
+                    "{} advisory source failed: {e}; audit results may be incomplete",
                     source.name()
-                );
+                ));
                 failed_sources.push(source.name().to_string());
             }
         }

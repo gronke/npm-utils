@@ -75,3 +75,6 @@ pub mod project;
 pub mod registry;
 // License/SBOM output (license summary · CycloneDX · SPDX) for a parsed `package-lock.json`.
 pub mod sbom;
+// Crate-internal `npm-utils:` warning routing — the CLI installs a sink so library warnings print
+// above a live progress region instead of corrupting it.
+mod warn;
