@@ -67,9 +67,9 @@ impl AdvisorySource for OsvSource {
                         out.push(advisory);
                     }
                 }
-                None => eprintln!(
-                    "npm-utils: OSV record {id} could not be fetched; audit results may be incomplete"
-                ),
+                None => crate::warn::warn(&format!(
+                    "OSV record {id} could not be fetched; audit results may be incomplete"
+                )),
             }
         }
         Ok(out)
