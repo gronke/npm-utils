@@ -24,6 +24,17 @@ pub fn from_lockfile(
     package_lock: &Path,
     dest: &Path,
 ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
+    from_lockfile_observed(package_lock, dest, |_| {})
+}
+
+/// [`from_lockfile`] with a progress observer: one [`InstallEvent::Fetch`] immediately before
+/// each package's download/verify/extract — the CLI's `[install]` task ticks from it. A
+/// skip-if-unchanged cache hit runs no populate step and emits no events.
+pub(crate) fn from_lockfile_observed(
+    package_lock: &Path,
+    dest: &Path,
+    mut on_event: impl FnMut(super::InstallEvent<'_>),
+) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
     let lockfile = Lockfile::parse(&std::fs::read_to_string(package_lock)?)?;
     // What this host installs: platform-matching, non-link entries that are registry tarballs.
     let installable: Vec<&LockedPackage> = lockfile
@@ -39,6 +50,12 @@ pub fn from_lockfile(
     super::run_install(dest, &want, |node_modules| {
         populated = true;
         for (i, pkg) in installable.iter().enumerate() {
+            on_event(super::InstallEvent::Fetch {
+                index: i + 1,
+                total: installable.len(),
+                name: &pkg.name,
+                version: &pkg.version,
+            });
             // The key (`node_modules/…`) is validated into a contained path under `dest`.
             let dir = safe_join(dest, &pkg.key)?;
             let url = pkg.resolved.as_deref().unwrap_or_default();
@@ -187,6 +204,50 @@ mod tests {
                 .map(|(n, p)| (n.to_string(), p.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn from_lockfile_observed_emits_fetch_before_each_download() {
+        // One required entry whose tarball URL points at a refused local port: the Fetch event
+        // is recorded and THEN the download fails — emission precedes the work. An empty lock
+        // emits nothing and succeeds. Both offline.
+        let tmp = tempdir().unwrap();
+        let lock_path = tmp.path().join("package-lock.json");
+        std::fs::write(
+            &lock_path,
+            r#"{ "name": "demo", "version": "1.0.0", "lockfileVersion": 3, "packages": {
+                "": { "name": "demo", "version": "1.0.0" },
+                "node_modules/x": { "version": "1.2.3", "resolved": "https://localhost:1/x.tgz", "integrity": "sha512-AAA" }
+            } }"#,
+        )
+        .unwrap();
+        let mut events: Vec<String> = Vec::new();
+        let result = from_lockfile_observed(&lock_path, tmp.path(), |event| {
+            let super::super::InstallEvent::Fetch {
+                index,
+                total,
+                name,
+                version,
+            } = event;
+            events.push(format!("{index}/{total} {name}@{version}"));
+        });
+        assert!(result.is_err(), "the tarball fetch cannot succeed offline");
+        assert_eq!(events, ["1/1 x@1.2.3"]);
+
+        // The empty lock: no installable entries → no events, and the install succeeds.
+        let empty = tempdir().unwrap();
+        let empty_lock = empty.path().join("package-lock.json");
+        std::fs::write(
+            &empty_lock,
+            r#"{ "name": "demo", "version": "1.0.0", "lockfileVersion": 3, "packages": {
+                "": { "name": "demo", "version": "1.0.0" }
+            } }"#,
+        )
+        .unwrap();
+        let mut count = 0;
+        let installed = from_lockfile_observed(&empty_lock, empty.path(), |_| count += 1).unwrap();
+        assert_eq!(count, 0);
+        assert!(installed.is_empty());
     }
 
     #[test]

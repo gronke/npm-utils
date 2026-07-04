@@ -1,14 +1,16 @@
 #![cfg(feature = "cli")]
-//! End-to-end test of the `npm-utils` CLI, driving the real binary the way a user does. The
-//! library unit-tests the pure pieces (manifest/lock writers, arg parsing); this exercises the
-//! whole `init → add → ci → upgrade` flow against the live registry, so it is network-gated:
+//! End-to-end tests of the `npm-utils` CLI, driving the real binary the way a user does. The
+//! library unit-tests the pure pieces (manifest/lock writers, arg parsing); the roundtrip tests
+//! here exercise the whole `init → add → ci → upgrade` flow against the live registry, so they
+//! are network-gated:
 //!
 //! ```text
 //! cargo test --features cli --test cli -- --include-ignored
 //! ```
 //!
 //! `ms` is a tiny, dependency-free, long-frozen package — a stable target whose tarball carries a
-//! known sha512, so integrity is genuinely verified end to end.
+//! known sha512, so integrity is genuinely verified end to end. The progress checks at the bottom
+//! run offline (empty lock / zero-dependency manifest — nothing to fetch).
 
 use std::process::Command;
 
@@ -175,4 +177,67 @@ fn remove_keeps_a_transitively_required_package() {
             .is_file(),
         "ms stays installed because debug requires it transitively"
     );
+}
+
+/// `ci` renders an `[install]` task even for an empty lock — begin line, then a finish with the
+/// count and elapsed seconds. Offline: no installable entries means nothing is fetched.
+#[test]
+fn ci_of_an_empty_lock_shows_an_install_task() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package-lock.json"),
+        r#"{ "name": "demo", "version": "1.0.0", "lockfileVersion": 3, "packages": {
+            "": { "name": "demo", "version": "1.0.0" }
+        } }"#,
+    )
+    .unwrap();
+    let out = npm_utils()
+        .args(["ci", project.path().to_str().unwrap()])
+        .output()
+        .expect("spawn npm-utils ci");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[install] installing packages"), "{stderr}");
+    assert!(stderr.contains("0 packages ("), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("installed 0 package(s)"));
+}
+
+/// `install --lockfile-only` renders a `[resolve]` task naming the registry host. Offline: a
+/// zero-dependency manifest resolves to an empty tree without any fetch.
+#[test]
+fn lockfile_only_install_shows_a_resolve_task_offline() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{ "name": "demo", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    let out = npm_utils()
+        .args([
+            "install",
+            "--lockfile-only",
+            "--dir",
+            project.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn npm-utils install");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[resolve] resolving dependency tree from registry.npmjs.org"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("0 packages ("), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("wrote "));
+    assert!(project.path().join("package-lock.json").is_file());
 }

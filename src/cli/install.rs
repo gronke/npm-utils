@@ -10,10 +10,13 @@
 
 use std::path::Path;
 
-use super::common::{self, read_manifest, report_installed, sync};
+use super::common::{
+    self, host_of, read_manifest, report_installed, sync, ResolveTicker, SyncTasks,
+};
+use super::progress::Progress;
 use super::Res;
-use crate::install::node_modules;
-use crate::package_json::lock::write_from_manifest;
+use crate::install::node_modules_observed;
+use crate::package_json::lock::write_from_manifest_observed;
 use crate::registry::{PackumentDetail, Registry};
 
 /// Record any `sources` in the manifest first — the same `name` / `name@range` / `name=range`
@@ -29,27 +32,45 @@ pub(super) fn run(
     lockfile_only: bool,
     no_lockfile: bool,
     detail: PackumentDetail,
+    progress: &Progress,
 ) -> Res {
     if !sources.is_empty() {
         common::add_specs(sources, dir, "install")?;
     }
 
     if no_lockfile {
-        report_installed(&node_modules(&dir.join("package.json"), dir)?);
+        let tasks = SyncTasks::new(progress, "registry.npmjs.org");
+        let installed = node_modules_observed(
+            &dir.join("package.json"),
+            dir,
+            |event| tasks.on_resolve(event),
+            |event| tasks.on_install(event),
+        )?;
+        tasks.done(installed.len());
+        report_installed(&installed);
         return Ok(());
     }
 
     if lockfile_only {
+        let registry = Registry::npm().with_detail(detail);
         let lockfile = dir.join("package-lock.json");
-        write_from_manifest(
-            &dir.join("package.json"),
-            &lockfile,
-            &Registry::npm().with_detail(detail),
-        )?;
+        let task = progress.task(
+            "resolve",
+            format!(
+                "resolving dependency tree from {}",
+                host_of(&registry.base_url)
+            ),
+        );
+        let ticker = ResolveTicker::new(&task);
+        write_from_manifest_observed(&dir.join("package.json"), &lockfile, &registry, |event| {
+            ticker.observe(event)
+        })?;
+        let count = task.count();
+        task.finish(&format!("{count} packages"));
         println!("wrote {}", lockfile.display());
         return Ok(());
     }
 
     let doc = read_manifest(dir)?;
-    sync(dir, &doc, detail)
+    sync(dir, &doc, detail, progress)
 }

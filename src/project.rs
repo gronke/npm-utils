@@ -11,9 +11,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::install::from_lockfile;
+use crate::install::{from_lockfile_observed, InstallEvent};
 use crate::package_json::{lock, manifest, spec};
-use crate::registry::{PackumentDetail, Registry, Resolved};
+use crate::registry::{PackumentDetail, Registry, ResolveEvent, Resolved};
 use crate::Result;
 
 /// A single dependency version-range change — the unit of an [`upgrade`] plan (`from` → `to`).
@@ -51,12 +51,29 @@ pub fn write_manifest(dir: &Path, doc: &Value) -> Result<()> {
 /// tarball's sha512 verified). Returns the installed packages. Non-registry deps (git/`file:`) are
 /// recorded in the manifest but not resolved.
 pub fn sync(dir: &Path, doc: &Value, detail: PackumentDetail) -> Result<Vec<Resolved>> {
+    sync_observed(dir, doc, detail, |_| {}, |_| {})
+}
+
+/// [`sync`] with progress observers for its two phases: the resolve walk's
+/// [`ResolveEvent`]s while the lockfile is computed, then one [`InstallEvent`] per package as
+/// the locked tree installs — the CLI's `[resolve]`/`[install]` task pair ticks from them.
+pub(crate) fn sync_observed(
+    dir: &Path,
+    doc: &Value,
+    detail: PackumentDetail,
+    on_resolve: impl Fn(ResolveEvent<'_>) + Sync,
+    on_install: impl FnMut(InstallEvent<'_>),
+) -> Result<Vec<Resolved>> {
     let lockfile = dir.join("package-lock.json");
     std::fs::write(
         &lockfile,
-        lock::render_v3_from_manifest(doc, &Registry::npm().with_detail(detail))?,
+        lock::render_v3_from_manifest_observed(
+            doc,
+            &Registry::npm().with_detail(detail),
+            on_resolve,
+        )?,
     )?;
-    from_lockfile(&lockfile, dir)
+    from_lockfile_observed(&lockfile, dir, on_install)
 }
 
 /// Compute the upgrade plan **without writing anything** (the dry-run): for each selected registry
@@ -104,6 +121,19 @@ pub fn upgrade(
     packages: &[String],
     detail: PackumentDetail,
 ) -> Result<(Vec<Change>, Vec<Resolved>)> {
+    upgrade_observed(dir, packages, detail, |_| {}, |_| {})
+}
+
+/// [`upgrade`] with [`sync_observed`]'s progress observers. The plan phase stays unobserved —
+/// its per-dependency resolves are quick, and their time lands in the `[resolve]` task's
+/// elapsed total anyway.
+pub(crate) fn upgrade_observed(
+    dir: &Path,
+    packages: &[String],
+    detail: PackumentDetail,
+    on_resolve: impl Fn(ResolveEvent<'_>) + Sync,
+    on_install: impl FnMut(InstallEvent<'_>),
+) -> Result<(Vec<Change>, Vec<Resolved>)> {
     let mut doc = read_manifest(dir)?;
     let changes = plan_upgrade(&doc, packages, &Registry::npm())?;
     for change in &changes {
@@ -114,7 +144,7 @@ pub fn upgrade(
     if !changes.is_empty() {
         write_manifest(dir, &doc)?;
     }
-    let installed = sync(dir, &doc, detail)?;
+    let installed = sync_observed(dir, &doc, detail, on_resolve, on_install)?;
     Ok((changes, installed))
 }
 
@@ -131,6 +161,17 @@ pub fn remove(
     names: &[String],
     detail: PackumentDetail,
 ) -> Result<(Vec<String>, Vec<Resolved>)> {
+    remove_observed(dir, names, detail, |_| {}, |_| {})
+}
+
+/// [`remove`] with [`sync_observed`]'s progress observers.
+pub(crate) fn remove_observed(
+    dir: &Path,
+    names: &[String],
+    detail: PackumentDetail,
+    on_resolve: impl Fn(ResolveEvent<'_>) + Sync,
+    on_install: impl FnMut(InstallEvent<'_>),
+) -> Result<(Vec<String>, Vec<Resolved>)> {
     let mut doc = read_manifest(dir)?;
     let mut removed = Vec::new();
     for name in names {
@@ -139,7 +180,7 @@ pub fn remove(
         }
     }
     write_manifest(dir, &doc)?;
-    let installed = sync(dir, &doc, detail)?;
+    let installed = sync_observed(dir, &doc, detail, on_resolve, on_install)?;
     Ok((removed, installed))
 }
 

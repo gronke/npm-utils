@@ -4,13 +4,19 @@
 use std::path::Path;
 
 use super::common;
+use super::progress::Progress;
 use super::Res;
 use crate::registry::PackumentDetail;
 
 /// Record each package (latest → `^x.y.z` when no range given) in `package.json` (scaffolding one
 /// if absent), then `sync` the lock + `node_modules/`. The spec parsing and manifest work live in
 /// [`common::add_specs`], shared with `install <SOURCES>`.
-pub(super) fn run(packages: &[String], dir: &Path, detail: PackumentDetail) -> Res {
+pub(super) fn run(
+    packages: &[String],
+    dir: &Path,
+    detail: PackumentDetail,
+    progress: &Progress,
+) -> Res {
     let doc = common::add_specs(packages, dir, "add")?;
-    common::sync(dir, &doc, detail)
+    common::sync(dir, &doc, detail, progress)
 }
