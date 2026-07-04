@@ -247,14 +247,15 @@ impl Registry {
         &self,
         roots: &[(String, Range)],
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
-        self.resolve_tree_nested_observed(&required_roots(roots), |_, _| {})
+        self.resolve_tree_nested_observed(&required_roots(roots), |_| {})
             .map(|(packages, _omissions)| packages)
     }
 
-    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with a per-package progress observer
-    /// and the skipped dependencies reported: `on_resolved` is called once per resolved package
-    /// version, with the running total so far and the package just resolved — the CLI's `audit`
-    /// verb drives a live stderr line from it. Roots carry an `optional` flag (an
+    /// [`resolve_tree_nested`](Self::resolve_tree_nested) with a progress observer and the
+    /// skipped dependencies reported. `on_event` sees the walk's [`ResolveEvent`]s: packument
+    /// fetches beginning and ending on the prefetch pool's worker threads (hence the `Sync`
+    /// bound), and each resolved package on the calling thread — the CLI's `audit` verb drives
+    /// its `[resolve]` task from them. Roots carry an `optional` flag (an
     /// `optionalDependencies` root may fail to resolve without failing the walk). Resolution
     /// behavior (walk order, nested semantics, errors, sorting) is identical to
     /// [`resolve_tree_nested`](Self::resolve_tree_nested), which is this with a no-op observer,
@@ -262,17 +263,12 @@ impl Registry {
     pub(crate) fn resolve_tree_nested_observed<O>(
         &self,
         roots: &[(String, Range, bool)],
-        on_resolved: O,
+        on_event: O,
     ) -> Result<(Vec<Resolved>, Vec<Omission>), Box<dyn std::error::Error + Send + Sync>>
     where
-        O: FnMut(usize, &Resolved),
+        O: Fn(ResolveEvent<'_>) + Sync,
     {
-        self.resolve_walk(
-            roots,
-            |name| self.packument(name),
-            on_resolved,
-            NESTED_AUDIT,
-        )
+        self.resolve_walk(roots, |name| self.packument(name), on_event, NESTED_AUDIT)
     }
 
     /// [`resolve_tree`](Self::resolve_tree) with an injectable packument source, so the
@@ -285,13 +281,8 @@ impl Registry {
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
-        self.resolve_walk(
-            &required_roots(roots),
-            get_packument,
-            |_, _| {},
-            FLAT_INSTALL,
-        )
-        .map(|(packages, _omissions)| packages)
+        self.resolve_walk(&required_roots(roots), get_packument, |_| {}, FLAT_INSTALL)
+            .map(|(packages, _omissions)| packages)
     }
 
     /// [`resolve_tree_nested`](Self::resolve_tree_nested) with an injectable packument source —
@@ -308,13 +299,8 @@ impl Registry {
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
     {
-        self.resolve_walk(
-            &required_roots(roots),
-            get_packument,
-            |_, _| {},
-            NESTED_AUDIT,
-        )
-        .map(|(packages, _omissions)| packages)
+        self.resolve_walk(&required_roots(roots), get_packument, |_| {}, NESTED_AUDIT)
+            .map(|(packages, _omissions)| packages)
     }
 
     /// The shared graph walk. `policy.nested: false` errors on a version conflict (one version
@@ -322,10 +308,11 @@ impl Registry {
     /// version instead, as npm would by nesting a second copy. Under the audit policy the walk
     /// also traverses `optionalDependencies` and records what it cannot follow as [`Omission`]s
     /// — non-registry specs, and optional edges whose fetch or version selection fails — where
-    /// the install policy keeps every failure fatal. `on_resolved` sees the running count and
-    /// the package after each resolution (a deduped requirement does not tick). Terminates on
-    /// any graph: each iteration either reuses an already-resolved satisfying version, records
-    /// a `(name, version)` pair that wasn't there before, or skips.
+    /// the install policy keeps every failure fatal. `on_event` reports fetch begin/done from
+    /// the prefetch workers and each resolution on this thread (a deduped requirement does not
+    /// tick); it returns `()` and cannot affect control flow. Terminates on any graph: each
+    /// iteration either reuses an already-resolved satisfying version, records a
+    /// `(name, version)` pair that wasn't there before, or skips.
     ///
     /// The walk proceeds in rounds: each takes the whole BFS frontier, prefetches its packuments
     /// concurrently ([`prefetch_packuments`]), and then processes the entries in their original
@@ -336,12 +323,12 @@ impl Registry {
         &self,
         roots: &[(String, Range, bool)],
         get_packument: F,
-        mut on_resolved: O,
+        on_event: O,
         policy: WalkPolicy,
     ) -> Result<(Vec<Resolved>, Vec<Omission>), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
-        O: FnMut(usize, &Resolved),
+        O: Fn(ResolveEvent<'_>) + Sync,
     {
         use std::collections::{HashMap, VecDeque};
         let mut packuments: HashMap<String, Value> = HashMap::new();
@@ -359,6 +346,7 @@ impl Registry {
                 &mut fetch_errors,
                 !policy.skip_unsupported,
                 &get_packument,
+                &on_event,
             )?;
             for (name, range, optional) in batch {
                 if let Some(existing) = resolved.get(&name) {
@@ -456,7 +444,10 @@ impl Registry {
                     license,
                 };
                 count += 1;
-                on_resolved(count, &package);
+                on_event(ResolveEvent::Resolved {
+                    count,
+                    package: &package,
+                });
                 resolved
                     .entry(package.name.clone())
                     .or_default()
@@ -502,6 +493,32 @@ fn required_roots(roots: &[(String, Range)]) -> Vec<(String, Range, bool)> {
         .iter()
         .map(|(name, range)| (name.clone(), range.clone(), false))
         .collect()
+}
+
+/// A progress event from the shared graph walk
+/// ([`Registry::resolve_tree_nested_observed`]). `FetchBegin`/`FetchDone` fire on the prefetch
+/// pool's worker threads — cross-name order is nondeterministic, but per name Begin precedes
+/// Done, and Done fires on success *and* failure ("no longer in flight"). `Resolved` fires on
+/// the calling thread once per newly resolved package version (a deduped requirement does not
+/// tick), never concurrently with fetch events — the walk alternates prefetch rounds with
+/// sequential processing.
+pub(crate) enum ResolveEvent<'a> {
+    FetchBegin {
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        name: &'a str,
+    },
+    FetchDone {
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        name: &'a str,
+    },
+    Resolved {
+        /// The running total — the walk's own count, pinned by the determinism tests;
+        /// renderers keep their own counters.
+        #[allow(dead_code)]
+        count: usize,
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        package: &'a Resolved,
+    },
 }
 
 /// Record `omission` unless an identical one (same name, spec, reason) is already recorded —
@@ -594,20 +611,23 @@ type FetchedPackument = Result<Value, Box<dyn std::error::Error + Send + Sync>>;
 /// Otherwise (the audit walk) every failure is recorded in `fetch_errors` and the walk decides
 /// per entry: fatal for a required edge, an [`Omission`] for an optional one. A failed name is
 /// never re-fetched — later rounds see it in `fetch_errors` and skip it in the missing set — so
-/// every name is fetched exactly once regardless of outcome.
+/// every name is fetched exactly once regardless of outcome. Each attempted fetch is bracketed
+/// by [`ResolveEvent::FetchBegin`]/[`ResolveEvent::FetchDone`], emitted on the worker thread.
 ///
 /// No over-fetch on success paths: a name enters the walk's `resolved` map only via the
 /// fetch-and-select path, so every resolved name is already cached and a dedupe-bound batch
 /// entry never lands in the missing set.
-fn prefetch_packuments<F>(
+fn prefetch_packuments<F, O>(
     batch: &[(String, Range, bool)],
     packuments: &mut std::collections::HashMap<String, Value>,
     fetch_errors: &mut std::collections::HashMap<String, String>,
     fail_fast: bool,
     get_packument: &F,
+    on_event: &O,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     F: Fn(&str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> + Sync,
+    O: Fn(ResolveEvent<'_>) + Sync,
 {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -638,7 +658,9 @@ where
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(name) = missing.get(i) else { break };
+                on_event(ResolveEvent::FetchBegin { name });
                 let result = get_packument(name); // fetched before the slot lock is taken
+                on_event(ResolveEvent::FetchDone { name });
                 *results[i]
                     .lock()
                     .expect("no panic while holding a slot lock") = Some(result);
@@ -1210,7 +1232,7 @@ mod tests {
 
         let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
         let (resolved, omissions) = Registry::npm()
-            .resolve_walk(&roots, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .resolve_walk(&roots, source_from(&pkgs), |_| {}, NESTED_AUDIT)
             .unwrap();
         assert_eq!(pairs(&resolved), ["b@1.0.0", "root@1.0.0"]);
         assert_eq!(omissions.len(), 1, "{omissions:?}");
@@ -1236,7 +1258,7 @@ mod tests {
 
         let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
         let (resolved, omissions) = Registry::npm()
-            .resolve_walk(&roots, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .resolve_walk(&roots, source_from(&pkgs), |_| {}, NESTED_AUDIT)
             .unwrap();
         assert_eq!(pairs(&resolved), ["root@1.0.0"]);
         assert_eq!(omissions.len(), 1);
@@ -1254,7 +1276,7 @@ mod tests {
 
         let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
         let err = Registry::npm()
-            .resolve_walk(&roots, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .resolve_walk(&roots, source_from(&pkgs), |_| {}, NESTED_AUDIT)
             .unwrap_err();
         assert!(err.to_string().contains("no packument for gone"), "{err}");
     }
@@ -1286,7 +1308,7 @@ mod tests {
 
         let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
         let err = Registry::npm()
-            .resolve_walk(&roots, get, |_, _| {}, NESTED_AUDIT)
+            .resolve_walk(&roots, get, |_| {}, NESTED_AUDIT)
             .unwrap_err();
         assert!(err.to_string().contains("no packument for x"), "{err}");
         assert_eq!(
@@ -1310,7 +1332,7 @@ mod tests {
 
         let roots3 = vec![("a".to_string(), "^1".parse().unwrap(), false)];
         let (resolved, omissions) = Registry::npm()
-            .resolve_walk(&roots3, source_from(&pkgs), |_, _| {}, NESTED_AUDIT)
+            .resolve_walk(&roots3, source_from(&pkgs), |_| {}, NESTED_AUDIT)
             .unwrap();
         assert_eq!(pairs(&resolved), ["a@1.0.0", "b@1.0.0"]);
         assert_eq!(omissions.len(), 1);
@@ -1446,7 +1468,7 @@ mod tests {
 
         let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
         let (resolved, _) = Registry::npm()
-            .resolve_walk(&roots, get, |_, _| {}, NESTED_AUDIT)
+            .resolve_walk(&roots, get, |_| {}, NESTED_AUDIT)
             .unwrap();
         assert_eq!(resolved.len(), 13);
         assert!(
@@ -1488,20 +1510,40 @@ mod tests {
         };
 
         let roots = vec![("root".to_string(), "^1".parse().unwrap(), false)];
-        let mut seen: Vec<usize> = Vec::new();
+        let seen: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let begins = std::sync::atomic::AtomicUsize::new(0);
+        let dones = std::sync::atomic::AtomicUsize::new(0);
         let (resolved, _) = Registry::npm()
-            .resolve_walk(&roots, get, |n, _| seen.push(n), NESTED_AUDIT)
+            .resolve_walk(
+                &roots,
+                get,
+                |event| match event {
+                    // Fetch events arrive from worker threads in nondeterministic cross-name
+                    // order — count them, never sequence them.
+                    ResolveEvent::FetchBegin { .. } => {
+                        begins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ResolveEvent::FetchDone { .. } => {
+                        dones.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ResolveEvent::Resolved { count, .. } => seen.lock().unwrap().push(count),
+                },
+                NESTED_AUDIT,
+            )
             .unwrap();
 
-        // Every name fetched exactly once, despite ten same-round requirements on `shared`.
+        // Every name fetched exactly once, despite ten same-round requirements on `shared` —
+        // and every fetch bracketed by one Begin and one Done.
         let fetches = fetches.into_inner().unwrap();
         assert_eq!(fetches.len(), 12);
         assert!(
             fetches.values().all(|&n| n == 1),
             "duplicate fetches: {fetches:?}"
         );
+        assert_eq!(begins.into_inner(), 12);
+        assert_eq!(dones.into_inner(), 12);
         // Deterministic ticks and output: 12 resolutions in FIFO order, sorted result.
-        assert_eq!(seen, (1..=12).collect::<Vec<_>>());
+        assert_eq!(seen.into_inner().unwrap(), (1..=12).collect::<Vec<_>>());
         let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
         let expected: Vec<String> = parents
             .iter()
@@ -1526,7 +1568,7 @@ mod tests {
         pkgs.insert("c".into(), packument_with("1.5.0", &[]));
 
         let roots = vec![("a".to_string(), "^1".parse().unwrap(), false)];
-        let mut seen: Vec<String> = Vec::new();
+        let seen: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let (resolved, _) = Registry::npm()
             .resolve_walk(
                 &roots,
@@ -1535,15 +1577,87 @@ mod tests {
                         .cloned()
                         .ok_or_else(|| format!("no packument for {name}").into())
                 },
-                |n, r| seen.push(format!("{n} {}@{}", r.name, r.version)),
+                |event| {
+                    if let ResolveEvent::Resolved { count, package } = event {
+                        seen.lock()
+                            .unwrap()
+                            .push(format!("{count} {}@{}", package.name, package.version));
+                    }
+                },
                 NESTED_AUDIT,
             )
             .unwrap();
 
-        // One tick per resolution with the running total and the package, none for the deduped
+        // One event per resolution with the running total and the package, none for the deduped
         // requeue.
+        let seen = seen.into_inner().unwrap();
         assert_eq!(seen, ["1 a@1.0.0", "2 b@1.2.0", "3 c@1.5.0"]);
         assert_eq!(seen.len(), resolved.len());
+    }
+
+    #[test]
+    fn fetch_events_bracket_each_fetch_once_including_failures() {
+        // `ok` resolves; `bad` is an *optional* root whose fetch fails → an omission under the
+        // audit policy. Every attempted name gets exactly one Begin and one Done — the failed
+        // fetch included ("no longer in flight") — and Resolved counts stay the walk's 1..=n.
+        let mut pkgs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        pkgs.insert("ok".into(), packument_with("1.0.0", &[]));
+
+        let events: std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let counts: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let roots = vec![
+            ("ok".to_string(), "^1".parse().unwrap(), false),
+            ("bad".to_string(), "^1".parse().unwrap(), true),
+        ];
+        let (resolved, omissions) = Registry::npm()
+            .resolve_walk(
+                &roots,
+                |name| {
+                    pkgs.get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("no packument for {name}").into())
+                },
+                |event| match event {
+                    ResolveEvent::FetchBegin { name } => {
+                        events
+                            .lock()
+                            .unwrap()
+                            .entry(name.to_string())
+                            .or_default()
+                            .0 += 1;
+                    }
+                    ResolveEvent::FetchDone { name } => {
+                        events
+                            .lock()
+                            .unwrap()
+                            .entry(name.to_string())
+                            .or_default()
+                            .1 += 1;
+                    }
+                    ResolveEvent::Resolved { count, .. } => counts.lock().unwrap().push(count),
+                },
+                NESTED_AUDIT,
+            )
+            .unwrap();
+
+        let events = events.into_inner().unwrap();
+        assert_eq!(events.get("ok"), Some(&(1, 1)));
+        assert_eq!(
+            events.get("bad"),
+            Some(&(1, 1)),
+            "a failed fetch still closes"
+        );
+        assert_eq!(counts.into_inner().unwrap(), [1]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(omissions.len(), 1);
+        assert!(
+            omissions[0]
+                .reason
+                .contains("optional dependency failed to fetch"),
+            "{}",
+            omissions[0]
+        );
     }
 
     #[test]

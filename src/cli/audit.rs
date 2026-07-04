@@ -20,6 +20,7 @@ use std::io::Write as _;
 use clap::ValueEnum;
 use serde_json::Value;
 
+use super::common::{host_of, ResolveTicker};
 use super::progress::{Progress, TaskStatus};
 use super::source::{classify_file, contained_file, BareToken, FileKind, Source};
 use super::Res;
@@ -219,22 +220,12 @@ fn components_from_manifest(
             host_of(&registry.base_url)
         ),
     );
-    let (resolved, walk_omissions) = registry.resolve_tree_nested_observed(&roots, |_n, r| {
-        task.inc(&format!("{}@{}", r.name, r.version))
-    })?;
+    let ticker = ResolveTicker::new(&task);
+    let (resolved, walk_omissions) =
+        registry.resolve_tree_nested_observed(&roots, |event| ticker.observe(event))?;
     task.finish(&format!("{} packages", resolved.len()));
     omissions.extend(walk_omissions);
     Ok((sbom::components_from_resolved(&resolved), omissions))
-}
-
-/// The display host of a registry base URL — scheme and path stripped
-/// (`https://r.example/npm/` → `r.example`); purely cosmetic, for the resolution status line.
-fn host_of(url: &str) -> &str {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    rest.split('/').next().unwrap_or(rest)
 }
 
 fn read_text(path: &std::path::Path) -> Res<String> {

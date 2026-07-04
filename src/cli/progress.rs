@@ -294,7 +294,6 @@ impl TaskStatus {
 
     /// Update the live detail line with transient state (in-flight fetches, the current file).
     /// Text modes ignore it — transient state is not an item, and logs get one line per item.
-    #[allow(dead_code)] // wired by the resolver's in-flight ticker in a follow-up commit
     pub(super) fn detail(&self, text: &str) {
         if let Some(bar) = &self.bar {
             bar.set_message(text.to_string());
