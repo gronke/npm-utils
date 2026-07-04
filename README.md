@@ -117,11 +117,31 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-      --timeout <SECS>  Per-fetch timeout in seconds (default 120) — caps each registry/tarball request, not the whole run
-      --no-timeout      Disable download timeouts entirely (no per-fetch or connect bound)
-  -q, --quiet           Suppress status lines on stderr (reports on stdout and npm-utils: error messages still print)
-  -h, --help            Print help
-  -V, --version         Print version
+      --timeout <SECS>
+          Per-fetch timeout in seconds (default 120) — caps each registry/tarball request, not the whole run
+
+      --no-timeout
+          Disable download timeouts entirely (no per-fetch or connect bound)
+
+      --progress <MODE>
+          Progress rendering on stderr: auto (live on a terminal), on (live even piped), verbose (a line per event), none
+
+          Possible values:
+          - auto:    Live rendering on a terminal, plain line pairs when piped
+          - on:      Live rendering even when stderr is piped
+          - verbose: One terminated line per event — logfile-friendly, no control characters
+          - none:    No status output (npm-utils: warnings and errors still print)
+
+          [default: auto]
+
+  -q, --quiet
+          Suppress status lines on stderr — shorthand for --progress=none (reports on stdout and npm-utils: messages still print)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 Run `npm-utils <command> --help` for a verb's flags.
@@ -182,6 +202,24 @@ $ npm-utils audit lit=^3                      # a package and its full transitiv
 
 A finding at or above `--audit-level` exits `1`, and an **incomplete** audit — failed advisory sources or unaudited dependencies — fails closed with exit `2` unless `--allow-incomplete`.
 [docs/audit.md](docs/audit.md) covers the details: source spellings, the in-memory nested resolution, omissions, and the full exit and flag semantics.
+
+### Progress output
+
+Long-running phases report progress on **stderr** as named tasks (every fetch inside them is bounded by `--timeout`): `[resolve]` while a dependency tree resolves, with the in-flight registry fetches on its detail line; `[install]` with an `(x/y)` counter while tarballs download, verify, and extract (`install`/`ci`/`add`/`remove`/`upgrade`); one `[npm]`/`[osv]` task per advisory source during an audit.
+The report on stdout (including `--format json`) and `npm-utils:` warnings/errors are never affected, so piping stdout stays clean in every mode.
+The global `--progress <MODE>` selects the rendering:
+
+| `--progress` | renders |
+|---|---|
+| `auto` (default) | live multi-line task blocks on a terminal; plain begin/finish line pairs when stderr is piped |
+| `on` (also `1`, `yes`, `true`) | the live rendering even when stderr is piped |
+| `verbose` | one terminated line per event — begin, each item, finish — no control characters, for logfiles |
+| `none` (also `0`, `off`, `false`, `no`) | no status output; `-q`/`--quiet` is the shorthand |
+
+```console
+$ npm-utils ci --progress=verbose 2>install.log   # one line per installed package, log-friendly
+$ npm-utils audit -q --format json | jq .         # silent stderr, clean JSON on stdout
+```
 
 ## Examples
 
