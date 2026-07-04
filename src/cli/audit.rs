@@ -20,7 +20,7 @@ use std::io::Write as _;
 use clap::ValueEnum;
 use serde_json::Value;
 
-use super::progress::{Phase, Progress};
+use super::progress::{Progress, TaskStatus};
 use super::source::{classify_file, contained_file, BareToken, FileKind, Source};
 use super::Res;
 use crate::audit::npm::NpmRegistrySource;
@@ -73,9 +73,9 @@ pub(super) enum SourceKind {
 /// the selected advisory sources, and print the report. Exits `1` when an advisory at or above
 /// `audit_level` is found (after printing), `2` when the audit is incomplete — every source
 /// failed, or some dependencies could not be audited — unless `--allow-incomplete`, and `0` when
-/// clean. Status lines — a live resolution line for manifest/spec sources and one begin/done
-/// pair per advisory source, emitted even for an empty component set — go to stderr via
-/// `progress`; `--quiet` silences them, never the report or errors.
+/// clean. Progress — a `[resolve]` task for manifest/spec sources and one task per advisory
+/// source, emitted even for an empty component set — goes to stderr per the global
+/// `--progress` mode; `--progress=none` (or `-q`) silences it, never the report or errors.
 pub(super) fn run(
     source: &str,
     audit_level: AuditLevel,
@@ -90,22 +90,24 @@ pub(super) fn run(
     let (components, omissions) = load_components(&src, &reg, progress)?;
 
     let active = build_sources(sources, registry);
-    // Render each source's Begin/Done/Failed as a terminated line pair; every Begin is followed
-    // by exactly one Done/Failed, so `phase` is None again when run_audit_observed returns.
-    let mut phase: Option<Phase> = None;
+    // Render each source's Begin/Done/Failed as a task; every Begin is followed by exactly one
+    // Done/Failed, so `task` is None again when run_audit_observed returns — nothing stays open
+    // past this call (the exits below run no destructors).
+    let mut task: Option<TaskStatus> = None;
     let mut report = audit::run_audit_observed(&components, &active, |event| match event {
         SourceEvent::Begin { name } => {
-            phase = Some(progress.step(format!("querying {name} advisories")));
+            task = Some(progress.task(name, format!("querying {name} advisories")));
         }
         SourceEvent::Done { advisories } => {
-            if let Some(p) = phase.take() {
+            if let Some(t) = task.take() {
                 let plural = if advisories == 1 { "y" } else { "ies" };
-                p.finish(&format!("{advisories} advisor{plural}"));
+                t.finish(&format!("{advisories} advisor{plural}"));
             }
         }
+        // Failed fires before the library's warn line, so the task closes first.
         SourceEvent::Failed => {
-            if let Some(p) = phase.take() {
-                p.finish("failed");
+            if let Some(t) = task.take() {
+                t.fail("failed");
             }
         }
     });
@@ -210,14 +212,17 @@ fn components_from_manifest(
 ) -> Res<(Vec<Component>, Vec<Omission>)> {
     // Roots first: a garbage manifest errors before any status line begins.
     let (roots, mut omissions) = audit_roots(doc)?;
-    let mut phase = progress.counted(format!(
-        "resolving dependency tree from {}",
-        host_of(&registry.base_url)
-    ));
-    let (resolved, walk_omissions) = registry.resolve_tree_nested_observed(&roots, |n, r| {
-        phase.tick(&format!("{n} {}@{}", r.name, r.version))
+    let task = progress.task(
+        "resolve",
+        format!(
+            "resolving dependency tree from {}",
+            host_of(&registry.base_url)
+        ),
+    );
+    let (resolved, walk_omissions) = registry.resolve_tree_nested_observed(&roots, |_n, r| {
+        task.inc(&format!("{}@{}", r.name, r.version))
     })?;
-    phase.finish(&format!("{} packages", resolved.len()));
+    task.finish(&format!("{} packages", resolved.len()));
     omissions.extend(walk_omissions);
     Ok((sbom::components_from_resolved(&resolved), omissions))
 }
