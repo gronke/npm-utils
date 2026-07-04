@@ -13,7 +13,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use super::{manifest, spec};
-use crate::registry::{Omission, Registry};
+use crate::registry::{Omission, Registry, ResolveEvent};
 
 /// A parsed `package-lock.json`.
 #[derive(Debug, Clone)]
@@ -201,11 +201,21 @@ pub fn render_v3_from_manifest(
     doc: &Value,
     registry: &Registry,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    render_v3_from_manifest_observed(doc, registry, |_| {})
+}
+
+/// [`render_v3_from_manifest`] with the resolve walk's progress observer
+/// ([`ResolveEvent`]) — the CLI's lockfile-writing verbs drive their `[resolve]` tasks from it.
+pub(crate) fn render_v3_from_manifest_observed(
+    doc: &Value,
+    registry: &Registry,
+    on_resolve: impl Fn(ResolveEvent<'_>) + Sync,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let direct = manifest::dependencies(doc);
     let roots = registry_roots(doc)?;
 
     let entries: Vec<LockEntry> = registry
-        .resolve_tree(&roots)?
+        .resolve_tree_observed(&roots, on_resolve)?
         .into_iter()
         .map(|r| LockEntry {
             name: r.name,
@@ -306,11 +316,21 @@ pub fn write_from_manifest(
     lockfile_path: &Path,
     registry: &Registry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    write_from_manifest_observed(manifest_path, lockfile_path, registry, |_| {})
+}
+
+/// [`write_from_manifest`] with the resolve walk's progress observer ([`ResolveEvent`]).
+pub(crate) fn write_from_manifest_observed(
+    manifest_path: &Path,
+    lockfile_path: &Path,
+    registry: &Registry,
+    on_resolve: impl Fn(ResolveEvent<'_>) + Sync,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let text = std::fs::read_to_string(manifest_path)
         .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
     let doc: Value = serde_json::from_str(&text)
         .map_err(|e| format!("parsing {}: {e}", manifest_path.display()))?;
-    let lockfile = render_v3_from_manifest(&doc, registry)?;
+    let lockfile = render_v3_from_manifest_observed(&doc, registry, on_resolve)?;
     std::fs::write(lockfile_path, lockfile)
         .map_err(|e| format!("writing {}: {e}", lockfile_path.display()))?;
     Ok(())

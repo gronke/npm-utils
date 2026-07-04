@@ -17,7 +17,30 @@ mod lockfile;
 mod node_modules;
 
 pub use lockfile::from_lockfile;
+pub(crate) use lockfile::from_lockfile_observed;
 pub use node_modules::node_modules;
+// Only the cli-gated `install` verb drives this seam directly (`from_lockfile_observed` is also
+// consumed by `project`, so it stays unconditional).
+#[cfg(feature = "cli")]
+pub(crate) use node_modules::node_modules_observed;
+
+/// One unit of install work, emitted immediately *before* a package's download/verify/extract —
+/// a renderer shows the package in flight. Installs run sequentially on the calling thread, so
+/// `FnMut` observers suffice.
+pub(crate) enum InstallEvent<'a> {
+    Fetch {
+        /// 1-based position — the walk's own numbering, pinned by the seam tests; renderers
+        /// count for themselves (events are ordered).
+        #[allow(dead_code)]
+        index: usize,
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        total: usize,
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        name: &'a str,
+        #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+        version: &'a str,
+    },
+}
 
 /// The shared skip-if-unchanged install dance: under a cross-process lock, short-circuit when
 /// `node_modules/` is populated and `marker_input` is unchanged; otherwise wipe it, run

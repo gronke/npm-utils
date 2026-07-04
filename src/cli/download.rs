@@ -2,14 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
+use super::progress::Progress;
 use super::Res;
 use crate::package_json::spec;
 use crate::registry::Registry;
 
-/// Resolve `range`, fetch the tarball, and write it to `out` (or `<name>-<version>.tgz`).
-pub(super) fn run(name: &str, range: &str, out: Option<&Path>) -> Res {
+/// Resolve `range`, fetch the tarball, and write it to `out` (or `<name>-<version>.tgz`). The
+/// `[download]` task counts the resolved package and finishes with the byte size (a live
+/// per-chunk rate line is future scope — `download::fetch` has no streaming seam yet).
+pub(super) fn run(name: &str, range: &str, out: Option<&Path>, progress: &Progress) -> Res {
+    let task = progress.task("download", format!("downloading {name}"));
     let r = Registry::npm().resolve(name, &spec::Range::parse(range)?)?;
+    task.inc(&format!("{}@{}", r.name, r.version));
     let bytes = crate::download::fetch(&r.tarball_url)?;
+    task.finish(&format!("{} bytes", bytes.len()));
     let unscoped = name.rsplit('/').next().unwrap_or(name);
     let path = out
         .map(Path::to_path_buf)

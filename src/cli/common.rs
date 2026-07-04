@@ -10,9 +10,10 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use super::progress::TaskStatus;
+use super::progress::{Progress, TaskStatus};
 use super::source::{BareToken, Source};
 use super::Res;
+use crate::install::InstallEvent;
 use crate::package_json::{manifest, spec};
 use crate::registry::{PackumentDetail, Registry, ResolveEvent, Resolved};
 
@@ -45,10 +46,21 @@ pub(super) fn add_specs(tokens: &[String], dir: &Path, verb: &str) -> Res<Value>
 }
 
 /// Rewrite the lock from the manifest and install, then print the installed tree. The library
-/// [`crate::project::sync`] does the work and returns the packages; this thin wrapper reports them
-/// (the `add` / `install` / `upgrade` verbs share it).
-pub(super) fn sync(dir: &Path, doc: &Value, detail: PackumentDetail) -> Res {
-    report_installed(&crate::project::sync(dir, doc, detail)?);
+/// [`crate::project::sync`] does the work and returns the packages; this thin wrapper renders
+/// its progress ([`SyncTasks`]) and reports them (the `add` / `install` / `upgrade` verbs share
+/// it).
+pub(super) fn sync(dir: &Path, doc: &Value, detail: PackumentDetail, progress: &Progress) -> Res {
+    // `project::sync` always resolves against the public registry (Registry::npm).
+    let tasks = SyncTasks::new(progress, "registry.npmjs.org");
+    let installed = crate::project::sync_observed(
+        dir,
+        doc,
+        detail,
+        |event| tasks.on_resolve(event),
+        |event| tasks.on_install(event),
+    )?;
+    tasks.done(installed.len());
+    report_installed(&installed);
     Ok(())
 }
 
@@ -78,21 +90,94 @@ impl<'t> ResolveTicker<'t> {
     }
 
     pub(super) fn observe(&self, event: ResolveEvent<'_>) {
-        match event {
-            ResolveEvent::FetchBegin { name } => {
-                let mut set = self.in_flight.lock().expect("in-flight set poisoned");
-                set.insert(name.to_string());
-                self.task.detail(&render_in_flight(&set));
-            }
-            ResolveEvent::FetchDone { name } => {
-                let mut set = self.in_flight.lock().expect("in-flight set poisoned");
-                set.remove(name);
-                self.task.detail(&render_in_flight(&set));
-            }
-            ResolveEvent::Resolved { package, .. } => {
-                self.task
-                    .inc(&format!("{}@{}", package.name, package.version));
-            }
+        tick_resolve(self.task, &self.in_flight, event);
+    }
+}
+
+/// The shared `[resolve]`-task rendering: fetch begin/done maintain the in-flight set and the
+/// detail line, a resolution counts the package ([`ResolveTicker`] and [`SyncTasks`] both route
+/// here).
+fn tick_resolve(task: &TaskStatus, in_flight: &Mutex<BTreeSet<String>>, event: ResolveEvent<'_>) {
+    match event {
+        ResolveEvent::FetchBegin { name } => {
+            let mut set = in_flight.lock().expect("in-flight set poisoned");
+            set.insert(name.to_string());
+            task.detail(&render_in_flight(&set));
+        }
+        ResolveEvent::FetchDone { name } => {
+            let mut set = in_flight.lock().expect("in-flight set poisoned");
+            set.remove(name);
+            task.detail(&render_in_flight(&set));
+        }
+        ResolveEvent::Resolved { package, .. } => {
+            task.inc(&format!("{}@{}", package.name, package.version));
+        }
+    }
+}
+
+/// Drives the `[resolve]` + `[install]` task pair around a sync-shaped library call
+/// ([`crate::project::sync_observed`] and friends). The resolve task is created eagerly — a
+/// zero-dependency project still shows the line, matching audit — and finishes with its package
+/// count on the first install event (resolution is over once installing starts) or in
+/// [`SyncTasks::done`]. The install task appears with the first [`InstallEvent`], so a
+/// skip-if-unchanged cache hit shows none.
+pub(super) struct SyncTasks<'p> {
+    progress: &'p Progress,
+    resolve: Mutex<Option<TaskStatus>>,
+    in_flight: Mutex<BTreeSet<String>>,
+    install: Mutex<Option<TaskStatus>>,
+}
+
+impl<'p> SyncTasks<'p> {
+    pub(super) fn new(progress: &'p Progress, host: &str) -> SyncTasks<'p> {
+        let resolve = progress.task("resolve", format!("resolving dependency tree from {host}"));
+        SyncTasks {
+            progress,
+            resolve: Mutex::new(Some(resolve)),
+            in_flight: Mutex::new(BTreeSet::new()),
+            install: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn on_resolve(&self, event: ResolveEvent<'_>) {
+        if let Some(task) = self.resolve.lock().expect("resolve task poisoned").as_ref() {
+            tick_resolve(task, &self.in_flight, event);
+        }
+    }
+
+    pub(super) fn on_install(&self, event: InstallEvent<'_>) {
+        let InstallEvent::Fetch {
+            total,
+            name,
+            version,
+            ..
+        } = event;
+        let mut install = self.install.lock().expect("install task poisoned");
+        if install.is_none() {
+            self.finish_resolve();
+            let task = self.progress.task("install", "installing packages");
+            task.set_total(total as u64);
+            *install = Some(task);
+        }
+        if let Some(task) = install.as_ref() {
+            task.inc(&format!("{name}@{version}"));
+        }
+    }
+
+    /// Finish whichever tasks are still open: the resolve task with its own count (no install
+    /// event ever arrived — lockfile-only or a cache hit), the install task with the final
+    /// installed count.
+    pub(super) fn done(self, installed: usize) {
+        self.finish_resolve();
+        if let Some(task) = self.install.lock().expect("install task poisoned").take() {
+            task.finish(&format!("{installed} packages"));
+        }
+    }
+
+    fn finish_resolve(&self) {
+        if let Some(task) = self.resolve.lock().expect("resolve task poisoned").take() {
+            let count = task.count();
+            task.finish(&format!("{count} packages"));
         }
     }
 }

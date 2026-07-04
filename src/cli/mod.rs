@@ -256,26 +256,35 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             lockfile_only,
             no_lockfile,
             license,
-        } => install::run(&sources, &dir, lockfile_only, no_lockfile, license.detail()),
-        Command::Ci { dir } => ci::run(&dir),
+        } => install::run(
+            &sources,
+            &dir,
+            lockfile_only,
+            no_lockfile,
+            license.detail(),
+            &progress,
+        ),
+        Command::Ci { dir } => ci::run(&dir, &progress),
         Command::Add {
             packages,
             dir,
             license,
-        } => add::run(&packages, &dir, license.detail()),
+        } => add::run(&packages, &dir, license.detail(), &progress),
         Command::Remove {
             packages,
             dir,
             license,
-        } => remove::run(&packages, &dir, license.detail()),
+        } => remove::run(&packages, &dir, license.detail(), &progress),
         Command::Init { dir, name } => init::run(&dir, name.as_deref()),
         Command::Upgrade {
             packages,
             dir,
             license,
-        } => upgrade::run(&packages, &dir, license.detail()),
+        } => upgrade::run(&packages, &dir, license.detail(), &progress),
         Command::Resolve { name, range } => resolve::run(&name, &range),
-        Command::Download { name, range, out } => download::run(&name, &range, out.as_deref()),
+        Command::Download { name, range, out } => {
+            download::run(&name, &range, out.as_deref(), &progress)
+        }
         Command::Search { query, limit } => search::run(&query.join(" "), limit),
         Command::Sbom {
             dir,

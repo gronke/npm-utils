@@ -224,7 +224,28 @@ impl Registry {
         &self,
         roots: &[(String, Range)],
     ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>> {
-        self.resolve_tree_from(roots, |name| self.packument(name))
+        self.resolve_tree_observed(roots, |_| {})
+    }
+
+    /// [`resolve_tree`](Self::resolve_tree) with the walk's progress observer ([`ResolveEvent`])
+    /// — the lockfile writer and the `node_modules` installer drive their `[resolve]` tasks from
+    /// it. Resolution behavior is identical to [`resolve_tree`](Self::resolve_tree), which is
+    /// this with a no-op observer.
+    pub(crate) fn resolve_tree_observed<O>(
+        &self,
+        roots: &[(String, Range)],
+        on_event: O,
+    ) -> Result<Vec<Resolved>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        O: Fn(ResolveEvent<'_>) + Sync,
+    {
+        self.resolve_walk(
+            &required_roots(roots),
+            |name| self.packument(name),
+            on_event,
+            FLAT_INSTALL,
+        )
+        .map(|(packages, _omissions)| packages)
     }
 
     /// Resolve the transitive dependency graph of `roots` the way npm's **nested**
@@ -271,8 +292,11 @@ impl Registry {
         self.resolve_walk(roots, |name| self.packument(name), on_event, NESTED_AUDIT)
     }
 
-    /// [`resolve_tree`](Self::resolve_tree) with an injectable packument source, so the
-    /// graph walk can be unit-tested without the network.
+    /// [`resolve_tree`](Self::resolve_tree) with an injectable packument source — a test-only
+    /// seam ([`resolve_tree`] itself routes through
+    /// [`resolve_tree_observed`](Self::resolve_tree_observed), so nothing outside the tests
+    /// calls this). Passes the same [`FLAT_INSTALL`] policy as the public method.
+    #[cfg(test)]
     fn resolve_tree_from<F>(
         &self,
         roots: &[(String, Range)],

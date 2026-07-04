@@ -244,7 +244,6 @@ struct Counts {
 impl TaskStatus {
     /// Declare the item total, upgrading the header to `(pos/len)`. `{len}` enters the live
     /// template only here, so an unset length is never rendered.
-    #[allow(dead_code)] // wired by the install-family tickers in a follow-up commit
     pub(super) fn set_total(&self, total: u64) {
         self.counts.lock().expect("progress state poisoned").total = Some(total);
         if let Some(bar) = &self.bar {
@@ -301,7 +300,6 @@ impl TaskStatus {
     }
 
     /// Items counted so far.
-    #[allow(dead_code)] // wired by the install-family tickers in a follow-up commit
     pub(super) fn count(&self) -> u64 {
         self.counts.lock().expect("progress state poisoned").pos
     }
