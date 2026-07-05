@@ -10,7 +10,7 @@ keywords = ["npm", "registry", "audit", "sbom", "lockfile"]
 license = "MIT"
 edition = "2021"
 rust-version = "1.88"   # floor set by the `time` dependency (MSRV 1.88); guarded by the CI msrv job
-include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**/*.rs", "Cargo.toml", "/README.md", "LICENSE"]
 
 [features]
 # The `npm-utils` / `cargo-npm-utils` command-line tool (pure-Rust `npm install` / `ci` / `add` /
