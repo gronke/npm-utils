@@ -749,4 +749,33 @@ mod cli {
                 > 0
         );
     }
+
+    /// Live: a lock audits packages, not install paths — an `npm:`-aliased entry and a
+    /// workspace-nested conflict copy are both checked under their real package name.
+    #[test]
+    #[ignore = "network: hits the npm advisory + OSV endpoints"]
+    fn live_audit_lock_covers_aliased_and_workspace_nested_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(
+            dir.path(),
+            r#"{
+                "": { "name": "ws", "version": "1.0.0" },
+                "node_modules/lodash-alias": {
+                    "name": "lodash",
+                    "version": "4.17.11",
+                    "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.11.tgz"
+                },
+                "app": { "name": "@ws/app", "version": "1.0.0" },
+                "app/node_modules/minimist": { "version": "1.2.0" }
+            }"#,
+        );
+
+        let out = audit(dir.path(), &[]);
+        assert_eq!(out.status.code(), Some(1), "both pins are vulnerable");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("lodash@4.17.11"), "{stdout}");
+        assert!(stdout.contains("GHSA-jf85-cpcp-j695"), "{stdout}");
+        assert!(stdout.contains("minimist@1.2.0"), "{stdout}");
+        assert!(!stdout.contains("lodash-alias"), "{stdout}");
+    }
 }

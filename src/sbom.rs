@@ -54,13 +54,16 @@ pub struct Component {
 }
 
 /// The real (non-root, non-link) packages a lockfile pins, as bill-of-materials components,
-/// sorted by name then version. The root `""` project entry and `link: true` workspace/`file:`
-/// links are excluded — a link is a local path, not a distributable package.
+/// sorted by name then version — one component per distinct `name@version` (a workspace lock
+/// can pin the same version at several paths). Every entry under a `node_modules/` segment
+/// counts, including ones nested below a workspace path (`app/node_modules/…`); the root `""`
+/// project entry, the workspace directories themselves, and `link: true` workspace/`file:`
+/// links are excluded — those are local paths, not distributable packages.
 pub fn components(lock: &Lockfile) -> Vec<Component> {
     let mut out: Vec<Component> = lock
         .packages
         .iter()
-        .filter(|p| p.key.starts_with("node_modules/") && !p.link)
+        .filter(|p| p.key.contains("node_modules/") && !p.link)
         .map(|p| Component {
             purl: npm_purl(&p.name, &p.version),
             name: p.name.clone(),
@@ -71,6 +74,7 @@ pub fn components(lock: &Lockfile) -> Vec<Component> {
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
+    out.dedup_by(|a, b| a.name == b.name && a.version == b.version);
     out
 }
 
@@ -360,6 +364,33 @@ mod tests {
         // Scoped purl percent-encodes the leading `@`.
         assert_eq!(c[0].purl, "pkg:npm/%40lit/context@1.1.6");
         assert_eq!(c[1].purl, "pkg:npm/lit@3.3.3");
+    }
+
+    #[test]
+    fn components_cover_nested_and_aliased_entries_once() {
+        // A workspace lock: `app` itself is a local path (excluded like the root and links),
+        // its nested conflict copy counts, and an aliased entry counts under its real name —
+        // identical name@version pairs collapse into one component.
+        let lock = Lockfile::parse(
+            r#"{
+            "name": "ws", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "ws", "version": "1.0.0" },
+                "app": { "name": "@ws/app", "version": "1.0.0" },
+                "node_modules/lodash": { "version": "4.17.21" },
+                "app/node_modules/lodash": { "version": "4.17.11" },
+                "node_modules/dash": { "name": "lodash", "version": "4.17.11" }
+            }
+        }"#,
+        )
+        .unwrap();
+        let c = components(&lock);
+        let ids: Vec<String> = c
+            .iter()
+            .map(|x| format!("{}@{}", x.name, x.version))
+            .collect();
+        assert_eq!(ids, ["lodash@4.17.11", "lodash@4.17.21"]);
+        assert_eq!(c[0].purl, "pkg:npm/lodash@4.17.11");
     }
 
     #[test]

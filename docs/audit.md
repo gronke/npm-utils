@@ -31,7 +31,7 @@ That resolution is nested like npm's: when requirements disagree (one parent wan
 
 What a manifest resolution **cannot** cover is never dropped silently: git / path / tarball / `workspace:` / `link:` deps, workspace packages, and failed optional deps are reported as **omissions** — a `note:` line above the summary, an `omissions` array in `--format json`, and an `AUDIT INCOMPLETE` marker.
 devDependencies are not resolved from a manifest.
-A lockfile source audits exactly what the lock pins, dev dependencies included, with no omissions; prefer it when one exists.
+A lockfile source audits exactly what the lock pins, with no omissions: dev dependencies, entries nested under workspace paths, and `npm:`-aliased entries under their real package name; prefer it when one exists.
 
 ## Exit semantics and flags
 
