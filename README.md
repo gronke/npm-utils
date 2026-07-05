@@ -224,6 +224,7 @@ $ npm-utils audit -q --format json | jq .         # silent stderr, clean JSON on
 ## Examples
 
 See [`examples/date-converter`](examples/date-converter) for a runnable Lit + `Temporal` demo that vendors its browser dependencies with this crate — no Node or bundler in the build.
+[`examples/audit-playground`](examples/audit-playground) pins deliberately outdated packages so `npm-utils audit` has something to find — a reproducible vulnerability report to explore.
 
 ## Scope
 

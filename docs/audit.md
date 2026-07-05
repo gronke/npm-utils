@@ -44,3 +44,23 @@ A missing/unreadable source is a hard error.
 
 Resolving and querying can take a while; every fetch is bounded by `--timeout` (120 s by default).
 Status output goes to stderr and never affects the report on stdout (including `--format json`) or `npm-utils:` errors, so piping stdout stays clean.
+
+## A worked example
+
+[`examples/audit-playground/`](../examples/audit-playground/) pins three deliberately outdated packages — its `package-lock.json` was written by `npm-utils add` itself — so one command reproduces a rich report:
+
+<!-- regenerate: cargo run --features cli --bin npm-utils -- audit examples/audit-playground -->
+
+```console
+$ npm-utils audit examples/audit-playground
+found 13 vulnerabilities (2 critical, 5 high, 5 moderate, 1 low) in 4 package(s)
+...
+qs@6.7.0
+  HIGH     GHSA-hrpp-h998-j3pp  qs vulnerable to Prototype Pollution
+    range >=6.7.0 <6.7.3 · CWE-1321 · https://github.com/advisories/GHSA-hrpp-h998-j3pp
+  ...
+```
+
+Nothing depends on `qs` directly — it enters through `body-parser@1.19.0` and is still attributed and version-matched, which is the nested resolution above at work.
+The findings exit `1` even under `--audit-level critical` (two are critical), and `npm audit` reads the same lock and reports the identical advisory set.
+A monorepo root manifest is the mirror image: facebook/react's carries only `devDependencies` and `workspaces`, so `audit` reports `found 0 vulnerabilities` yet exits `2` — the workspaces are an omission, and an audit that could not see everything fails closed unless `--allow-incomplete`.

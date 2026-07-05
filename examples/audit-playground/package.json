@@ -1,0 +1,9 @@
+{
+  "name": "audit-playground",
+  "version": "1.0.0",
+  "dependencies": {
+    "body-parser": "1.19.0",
+    "lodash": "4.17.11",
+    "minimist": "1.2.0"
+  }
+}
