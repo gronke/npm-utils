@@ -1,12 +1,10 @@
 # npm-utils
 
-Pure-Rust utilities for the **npm registry** and web assets —
-resolve a package version, download npm tarballs and GitHub archives, extract files, and install a real `node_modules/` from a `package.json` or `package-lock.json`.
+Pure-Rust utilities for the **npm registry** and web assets — resolve a package version, download npm tarballs and GitHub archives, extract files, and install a real `node_modules/` from a `package.json` or `package-lock.json`.
 No Node or npm at build time; just `ureq` + archive extraction.
 Handy from a `build.rs` to vendor browser/JS dependencies into your own asset tree.
 
-It's both a **library** (the modules below) and an optional **command-line tool** —
-a pure-Rust subset of npm's verbs (`install` / `add` / `ci` / `sbom` / …).
+It's both a **library** (the modules below) and an optional **command-line tool** — a pure-Rust subset of npm's verbs (`install` / `add` / `ci` / `sbom` / …).
 See [CLI](#cli).
 
 ## Library
@@ -94,8 +92,7 @@ The same engine ships as a command-line tool behind the `cli` feature — a pure
 cargo install npm-utils --features cli
 ```
 
-That installs two binaries — `npm-utils` and `cargo-npm-utils` —
-so every verb works standalone *or* as a cargo subcommand (`npm-utils add lit` ≡ `cargo npm-utils add lit`).
+That installs two binaries — `npm-utils` and `cargo-npm-utils` — so every verb works standalone *or* as a cargo subcommand (`npm-utils add lit` ≡ `cargo npm-utils add lit`).
 
 <!-- regenerate: cargo run --features cli --bin npm-utils -- --help -->
 
@@ -129,21 +126,14 @@ Options:
 
 Run `npm-utils <command> --help` for a verb's flags.
 
-> **Breaking in 0.6**: `install`'s positional arguments are now *packages* — `npm-utils install ms=^2 lit` records and installs them, like `npm install <pkg>`.
-> The project directory moved to `--dir` (as on `add`/`remove`/`upgrade`/`init`): `npm-utils install <dir>` becomes `npm-utils install --dir <dir>`.
-> A bare `npm-utils install` still installs the current project.
-> Note that npm-utils always operates on `--dir` (default `.`) as given; it does **not** search upward for a project root the way npm's [local prefix](https://docs.npmjs.com/cli/v11/commands/npm-prefix) does.
-
 Package sources are written `name`, `name@range`, or `name=range` (e.g. `lit`, `lit@^3`, `lit=^3`) — the `=` form is never ambiguous with a path, and `./`-prefixed arguments always read as paths.
 
 `install` / `add` / `upgrade` write a `lockfileVersion`-3 `package-lock.json` that both npm and `npm-utils ci` read — every tarball pinned with its `sha512`.
-It is an npm-compatible lock for the **registry/production tree**, not a byte-for-byte npm reproduction;
-the CLI mirrors npm's vocabulary for the subset it supports and is **not** a full npm drop-in.
+It is an npm-compatible lock for the **registry/production tree**, not a byte-for-byte npm reproduction; the CLI mirrors npm's vocabulary for the subset it supports and is **not** a full npm drop-in.
 
 ### License checks
 
-The lockfile-writing verbs default to the fast **abbreviated** packument, which carries no license;
-pass `--no-skip-license` to fetch the **full** packument and record each package's license in the lock.
+The lockfile-writing verbs default to the fast **abbreviated** packument, which carries no license; pass `--no-skip-license` to fetch the **full** packument and record each package's license in the lock.
 `sbom` then renders the license tree of the whole dependency graph — handy for auditing an external package you don't own:
 
 ```console
@@ -164,15 +154,11 @@ MIT (1)
   @types/trusted-types@2.0.7
 ```
 
-`npm-utils sbom --format cyclonedx` (or `spdx`) emits the same tree as a standards-based compliance document —
-each component carrying its purl, declared license, and `sha512`.
+`npm-utils sbom --format cyclonedx` (or `spdx`) emits the same tree as a standards-based compliance document — each component carrying its purl, declared license, and `sha512`.
 
 ### Vulnerability checks
 
-`audit` checks packages against vulnerability advisories — like `npm audit`, but
-querying **multiple sources** behind one trait. Two ship by default: npm's native registry endpoint and
-[OSV](https://osv.dev). Findings are deduped across sources (by GHSA/CVE alias) and filtered to the
-versions you actually have, so the npm endpoint's over-broad ranges don't cry wolf:
+`audit` checks packages against vulnerability advisories — like `npm audit`, but querying **multiple sources** behind one trait (npm's registry endpoint and [OSV](https://osv.dev) by default), deduped across sources and filtered to the versions you actually have:
 
 ```console
 $ npm-utils audit                             # query npm + OSV, group by package
@@ -186,8 +172,7 @@ lodash@4.17.11
   ...
 ```
 
-The positional source names what to audit — a project directory (its `package-lock.json`, else its
-`package.json`), an explicit manifest or lockfile path, or a registry spec:
+The positional source names what to audit — a project directory (its `package-lock.json`, else its `package.json`), an explicit manifest or lockfile path, or a registry spec:
 
 ```console
 $ npm-utils audit web/                        # a project directory: lockfile preferred
@@ -195,59 +180,18 @@ $ npm-utils audit /tmp/package.json           # an explicit package.json or pack
 $ npm-utils audit lit=^3                      # a package and its full transitive dependency tree
 ```
 
-Path sources take the usual spellings — relative, absolute, `~/…` (expanded even when the shell
-didn't), and Windows drive/UNC prefixes.
-
-A `package.json` or `name=range` source resolves its registry-reachable `dependencies` **and**
-`optionalDependencies` tree against the registry in memory — audit never writes a
-`package-lock.json` (nor needs one on disk). Optional deps of *every* platform are included (no
-`os`/`cpu` filtering: their advisories matter regardless of the auditing machine), and an optional
-dep that fails to resolve is tolerated, npm-style. That resolution is nested like npm's: when
-requirements disagree (one parent wants `glob@^4`, another pins `5.0.15`), every resolved version
-is kept and audited — an audit flags issues rather than installs, and if the tree would contain
-both versions, both versions' advisories matter. `npm:` aliases resolve and audit their target.
-
-What a manifest resolution **cannot** cover is never dropped silently: git / path / tarball /
-`workspace:` / `link:` deps, workspace packages, and failed optional deps are reported as
-**omissions** — a `note:` line above the summary, an `omissions` array in `--format json`, and an
-`AUDIT INCOMPLETE` marker. devDependencies are not resolved from a manifest. A lockfile source
-audits exactly what the lock pins, dev dependencies included, with no omissions; prefer it when
-one exists.
-
-Resolving a manifest or spec source and querying each advisory source can take a while (every fetch
-is bounded by `--timeout`, 120 s by default), so `audit` reports progress on **stderr**: a live
-line naming each dependency as it resolves on a terminal (plain begin/end lines with elapsed seconds when
-piped), and one `querying <source> advisories …` line pair per advisory source. `-q`/`--quiet`
-silences these status lines; the report on stdout (including `--format json`) and `npm-utils:`
-errors are never affected, so piping stdout stays clean either way.
-
-It mirrors npm's exit semantics with one strictness on top: `--audit-level
-<low|moderate|high|critical>` sets the bar, and the command exits `1` when a finding at or above
-it exists (default `low` — any vuln fails). A finding is a result, not an error: it prints the
-report and exits `1`. An **incomplete** audit fails closed with exit `2` unless
-`--allow-incomplete` opts back into fail-open — incomplete meaning every selected advisory source
-failed, or (with no findings to report first) some dependencies were omissions and thus never
-checked. One unreachable source merely degrades and marks the report incomplete. A
-missing/unreadable source is a hard error. `--format json` emits an `npm audit --json`-shaped
-report, `--sources npm,osv` selects sources, and `--registry <url>` points the npm advisory
-source *and* manifest/spec resolution at a private mirror.
+A finding at or above `--audit-level` exits `1`, and an **incomplete** audit — failed advisory sources or unaudited dependencies — fails closed with exit `2` unless `--allow-incomplete`.
+[docs/audit.md](docs/audit.md) covers the details: source spellings, the in-memory nested resolution, omissions, and the full exit and flag semantics.
 
 ## Examples
 
-See [`examples/date-converter`](examples/date-converter) for a runnable Lit + `Temporal` demo that vendors its browser dependencies with this crate —
-no Node or bundler in the build.
+See [`examples/date-converter`](examples/date-converter) for a runnable Lit + `Temporal` demo that vendors its browser dependencies with this crate — no Node or bundler in the build.
 
 ## Scope
 
-Not a general `npm`:
-npm-utils vendors **public-registry** packages and reproduces a committed `package-lock.json` — that's the remit.
+Not a general `npm`: npm-utils vendors **public-registry** packages and reproduces a committed `package-lock.json` — that's the remit.
 So: **no lifecycle scripts** (by design), **public registry only** (no `.npmrc`/auth), and `node_modules()` resolves a **flat, prod-only** tree that errors on a version conflict npm would nest — install from a lockfile (`from_lockfile`/`ci`) for a full tree.
 Anything unsupported — a dist-tag like `next`, `overrides`, lockfile v1 — fails with a clear error rather than silently.
-
-Two npm behaviors are deliberately absent for now (planned follow-ups):
-local directories as dependencies (`file:` specs — a directory or file source to `install`/`add` fails with a guided error), and npm's upward [local prefix](https://docs.npmjs.com/cli/v11/commands/npm-prefix) search — npm-utils always writes `node_modules/` under `--dir` (default: the working directory) exactly as given.
-Further audit-side follow-ups, tracked but not blocking:
-`peerDependencies`/`bundleDependencies` modeling, dependency provenance on resolved packages (which path introduced a version), a configurable resolver concurrency (fixed at 8 today), and `optionalDependencies` in the lockfile *writer* (the audit already traverses them; generated locks still record the flat prod tree).
 
 ## License
 
