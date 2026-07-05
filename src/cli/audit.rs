@@ -3,7 +3,9 @@
 //! Mirrors `npm audit`: prints a report and exits `1` when an advisory at or above the
 //! `--audit-level` threshold is found. The positional source names what to audit — a project
 //! directory (its `package-lock.json`, else its `package.json`), an explicit manifest or lockfile
-//! path, or a registry spec `name=range` (e.g. `lit=^3`). Manifest and spec sources resolve their
+//! path, or a registry spec `name=range` (e.g. `lit=^3`). The files a directory source discovers
+//! may be symlinks as long as they resolve inside that directory ([`contained_file`] is the
+//! guard); an explicit file path is used as given. Manifest and spec sources resolve their
 //! registry-reachable `dependencies` + `optionalDependencies` tree **in memory**; `audit` never
 //! writes a lockfile. Whatever that resolution cannot follow — git / path / tarball /
 //! `workspace:` specs, workspace packages, optional deps that fail to resolve — is reported as
@@ -19,7 +21,7 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use super::progress::{Phase, Progress};
-use super::source::{classify_file, BareToken, FileKind, Source};
+use super::source::{classify_file, contained_file, BareToken, FileKind, Source};
 use super::Res;
 use crate::audit::npm::NpmRegistrySource;
 use crate::audit::osv::OsvSource;
@@ -156,13 +158,15 @@ fn load_components(
     progress: &Progress,
 ) -> Res<(Vec<Component>, Vec<Omission>)> {
     match source {
+        // The files *discovered* inside a directory source may be symlinks, but must resolve
+        // inside that directory (containment on canonicalized paths — the path-traversal
+        // guard); an explicit `Source::File` path is the user's own choice, used as given.
         Source::Dir(dir) => {
-            let lock = dir.join("package-lock.json");
-            if lock.exists() {
+            if let Some(lock) = contained_file(dir, "package-lock.json")? {
                 let components = sbom::components(&Lockfile::parse(&read_text(&lock)?)?);
                 return Ok((components, Vec::new()));
             }
-            if dir.join("package.json").exists() {
+            if contained_file(dir, "package.json")?.is_some() {
                 return components_from_manifest(
                     &crate::project::read_manifest(dir)?,
                     registry,

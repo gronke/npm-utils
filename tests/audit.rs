@@ -367,6 +367,53 @@ mod cli {
         assert!(!dir.path().join("package-lock.json").exists());
     }
 
+    /// A `package-lock.json` symlinked to a file *outside* the directory source is refused with
+    /// a real error — a directory source only reads files that resolve inside it.
+    #[cfg(unix)]
+    #[test]
+    fn dir_source_rejects_a_lock_symlinked_outside() {
+        let outside = tempfile::tempdir().unwrap();
+        write_lock(
+            outside.path(),
+            r#"{ "": { "name": "demo", "version": "1.0.0" } }"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("package-lock.json"),
+            dir.path().join("package-lock.json"),
+        )
+        .unwrap();
+        let out = audit(dir.path(), &[]);
+        assert_ne!(out.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("npm-utils:") && stderr.contains("resolves outside"),
+            "{stderr}"
+        );
+    }
+
+    /// A symlinked lock is fine when it resolves *inside* the directory source — npm tooling
+    /// reads manifests through symlinks all the time.
+    #[cfg(unix)]
+    #[test]
+    fn dir_source_reads_a_lock_symlinked_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("real-lock.json"),
+            r#"{ "name": "demo", "version": "1.0.0", "lockfileVersion": 3, "packages": { "": { "name": "demo", "version": "1.0.0" } } }"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("real-lock.json", dir.path().join("package-lock.json")).unwrap();
+        let out = audit(dir.path(), &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("found 0 vulnerabilities"));
+    }
+
     /// When every selected source fails, the audit is incomplete: it exits `2` and marks the output
     /// incomplete rather than reporting a clean tree. Uses an unreachable registry (a refused
     /// localhost port), so it needs no external network.

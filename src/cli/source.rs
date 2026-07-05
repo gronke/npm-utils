@@ -219,6 +219,35 @@ fn path_source(
     }
 }
 
+/// A `name`d file inside a directory source, `None` when absent. The file may be a symlink —
+/// npm tooling reads manifests through symlinks all the time — but only one that **resolves
+/// inside** the directory: both paths are canonicalized first, so a symlinked
+/// `package-lock.json` cannot steer `audit web/` into reading a file outside `web/`. (An
+/// explicit *file* source is the user's own path and is deliberately used as given.)
+pub(super) fn contained_file(dir: &Path, name: &str) -> Res<Option<PathBuf>> {
+    let file = dir.join(name);
+    // Follows symlinks, like `probe_fs`: a dangling link reads as absent, not as an error.
+    match std::fs::metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat {}: {e}", file.display()).into()),
+        Ok(_) => {}
+    }
+    let canonical = |p: &Path| -> Res<PathBuf> {
+        p.canonicalize()
+            .map_err(|e| format!("resolving {}: {e}", p.display()).into())
+    };
+    let file_real = canonical(&file)?;
+    if !file_real.starts_with(canonical(dir)?) {
+        return Err(format!(
+            "{} resolves outside its source directory (to {})",
+            file.display(),
+            file_real.display()
+        )
+        .into());
+    }
+    Ok(Some(file))
+}
+
 /// A registry spec's name: the path-safety allowlist plus "no `/` outside a scope" (an unscoped
 /// name with a slash is a directory path or a GitHub shorthand, never a registry name).
 fn validate_spec_name(name: &str) -> Res {
@@ -435,6 +464,66 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("`add`") && err.contains("audit"), "{err}");
+    }
+
+    #[test]
+    fn contained_file_finds_regular_files_and_reads_absence_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            contained_file(dir.path(), "package-lock.json").unwrap(),
+            None
+        );
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(
+            contained_file(dir.path(), "package-lock.json").unwrap(),
+            Some(dir.path().join("package-lock.json"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_file_allows_symlinks_resolving_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real-lock.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("real-lock.json", dir.path().join("package-lock.json")).unwrap();
+        // A relative symlink to a sibling stays inside the (canonicalized) directory.
+        assert!(contained_file(dir.path(), "package-lock.json")
+            .unwrap()
+            .is_some());
+        // A dangling symlink reads as absent, exactly like the old `exists()` probe.
+        std::os::unix::fs::symlink("gone.json", dir.path().join("package.json")).unwrap();
+        assert_eq!(contained_file(dir.path(), "package.json").unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_file_rejects_symlinks_escaping_the_directory() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.json"), "{}").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.json"),
+            dir.path().join("package-lock.json"),
+        )
+        .unwrap();
+        let err = contained_file(dir.path(), "package-lock.json")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resolves outside"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_file_canonicalizes_the_directory_before_comparing() {
+        // The *directory* may itself be reached through a symlink (`audit ./link-to-project`):
+        // the containment base is the resolved directory, so its regular files pass.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("package.json"), "{}").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(contained_file(&link, "package.json").unwrap().is_some());
     }
 
     #[test]
