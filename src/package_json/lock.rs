@@ -30,7 +30,10 @@ pub struct Lockfile {
 pub struct LockedPackage {
     /// The map key: `""` for the root project, else a `node_modules/…`-relative path.
     pub key: String,
-    /// The package name — the segment after the last `node_modules/` (empty for the root).
+    /// The package name — the entry's `name` field when the lockfile records one (npm writes it
+    /// exactly when the installed path differs from the real package, i.e. an `npm:` alias; the
+    /// root `""` entry carries the project name), else the segment after the last
+    /// `node_modules/` (empty for the root).
     pub name: String,
     /// `version` from the entry (empty for the root or a pure link).
     pub version: String,
@@ -338,11 +341,20 @@ pub(crate) fn write_from_manifest_observed(
 
 impl LockedPackage {
     fn from_entry(key: &str, entry: &Map<String, Value>) -> LockedPackage {
-        let name = key
-            .rsplit_once("node_modules/")
-            .map(|(_, n)| n)
-            .unwrap_or(key)
-            .to_string();
+        // Prefer the entry's `name` field: npm records it when the installed path differs from
+        // the real package (an `npm:` alias), and advisory queries, purls, and string-form bins
+        // must name the real package. Install paths keep coming from the key.
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                key.rsplit_once("node_modules/")
+                    .map(|(_, n)| n)
+                    .unwrap_or(key)
+                    .to_string()
+            });
         LockedPackage {
             bin: bin_entries(entry, &name),
             key: key.to_string(),
@@ -528,6 +540,37 @@ mod tests {
         assert!(ts.bin.iter().any(|(n, _)| n == "tsserver"));
         // The link entry is parsed (faithful) but excluded from installable.
         assert!(lock.packages.iter().any(|p| p.link));
+    }
+
+    #[test]
+    fn name_field_wins_over_the_install_path() {
+        // npm writes `name` when the installed path differs from the real package — an `npm:`
+        // alias — and on the root entry; a workspace-nested key still derives from its key.
+        let lock = Lockfile::parse(
+            r#"{
+              "name": "ws", "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "ws" },
+                "node_modules/lodash-alias": {
+                  "name": "lodash",
+                  "version": "4.17.11",
+                  "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.11.tgz",
+                  "bin": "cli.js"
+                },
+                "app/node_modules/minimist": { "version": "1.2.0" }
+              }
+            }"#,
+        )
+        .unwrap();
+        let by_key = |k: &str| lock.packages.iter().find(|p| p.key == k).unwrap();
+        assert_eq!(by_key("node_modules/lodash-alias").name, "lodash");
+        // The string-form bin takes the real package's (unscoped) name too.
+        assert_eq!(
+            by_key("node_modules/lodash-alias").bin,
+            [("lodash".to_string(), "cli.js".to_string())]
+        );
+        assert_eq!(by_key("app/node_modules/minimist").name, "minimist");
+        assert_eq!(by_key("").name, "ws");
     }
 
     #[test]
