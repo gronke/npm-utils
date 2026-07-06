@@ -18,6 +18,9 @@
 //! - [`package_json`] — read pinned dependency versions from a `package.json`, and
 //!   resolve its `exports`/`module`/`browser`/`main` to browser entry points (for
 //!   generating an ES-module import map).
+//! - [`resolve`] — locate files inside an installed dependency under `node_modules/`:
+//!   walk up to `node_modules/<name>` and map a `<name>/<subpath>` to a real file,
+//!   honoring the package's `exports` when declared.
 //! - [`install`] — produce a real `node_modules/` directory, pure Rust, with every tarball
 //!   sha512-verified: resolve a `package.json`'s transitive `dependencies` against the registry
 //!   ([`install::node_modules`]), or install the exact tree a `package-lock.json` pins —
@@ -73,6 +76,10 @@ pub mod path_safety;
 // step — the IO orchestration over the pure `package_json` transforms and `registry`/`install`.
 pub mod project;
 pub mod registry;
+// Locate files inside an installed `node_modules/<name>`: walk up to the package and map a
+// `<name>/<subpath>` to a real file on disk, honoring `exports`. The IO counterpart to the pure
+// `package_json` resolver, and the foundation web_modules builds `npm://` asset references on.
+pub mod resolve;
 // License/SBOM output (license summary · CycloneDX · SPDX) for a parsed `package-lock.json`.
 pub mod sbom;
 // Crate-internal `npm-utils:` warning routing — the CLI installs a sink so library warnings print
