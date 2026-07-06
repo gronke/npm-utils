@@ -40,8 +40,8 @@ pub fn package_dir(from_dir: &Path, name: &str) -> Result<PathBuf> {
 /// When the package declares `exports`, only the subpaths it maps resolve — one it
 /// does not is refused, mirroring Node's `ERR_PACKAGE_PATH_NOT_EXPORTED`; otherwise
 /// the file is addressed directly (Node's behavior for a package without `exports`,
-/// e.g. `bootstrap-icons`). The returned path is guaranteed to sit inside the
-/// package directory.
+/// e.g. `bootstrap-icons`). The result is canonicalized and guaranteed to sit inside the
+/// package's real directory — an in-package symlink resolving outside it is refused.
 pub fn package_file(from_dir: &Path, name: &str, subpath: &str) -> Result<PathBuf> {
     let dir = package_dir(from_dir, name)?;
     let manifest = dir.join("package.json");
@@ -69,14 +69,23 @@ pub fn package_file(from_dir: &Path, name: &str, subpath: &str) -> Result<PathBu
             .trim_start_matches('/')
             .to_string()
     };
-    let file = safe_join(&dir, &relative)?;
-    if !file.is_file() {
-        return Err(format!(
-            "{name}/{subpath} resolves to {relative:?}, which is not a file in the package"
-        )
-        .into());
+    let candidate = safe_join(&dir, &relative)?;
+    // Resolve through the package's real on-disk location and require the result to stay
+    // inside it. `subpath` is attacker-influenced (an `npm://` symlink target, or a
+    // dependency's own layout), and a symlink *inside* the package could otherwise
+    // redirect the read outside it — so containment is enforced on the canonical path,
+    // not on the joined string `safe_join` only checks structurally.
+    let package_root = dir.canonicalize()?;
+    let real = candidate
+        .canonicalize()
+        .map_err(|e| -> crate::Error { format!("{name}/{subpath}: {e}").into() })?;
+    if !real.starts_with(&package_root) {
+        return Err(format!("{name}/{subpath}: resolves outside {name}").into());
     }
-    Ok(file)
+    if !real.is_file() {
+        return Err(format!("{name}/{subpath}: not a file in the package").into());
+    }
+    Ok(real)
 }
 
 #[cfg(test)]
@@ -161,5 +170,26 @@ mod tests {
         );
         let file = package_file(tmp.path(), "@scope/pkg", "a/b.svg").unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_file_refuses_an_in_package_symlink_that_escapes() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        install(
+            tmp.path(),
+            "pkg",
+            r#"{"name":"pkg"}"#,
+            &[("ok.svg", "<svg/>")],
+        );
+        // A secret outside the package, and an in-package symlink pointing at it.
+        std::fs::write(tmp.path().join("secret.txt"), "top secret").unwrap();
+        let pkg = tmp.path().join("node_modules").join("pkg");
+        symlink(tmp.path().join("secret.txt"), pkg.join("leak.txt")).unwrap();
+
+        // The escaping symlink is refused; an ordinary in-package file still resolves.
+        assert!(package_file(tmp.path(), "pkg", "leak.txt").is_err());
+        assert!(package_file(tmp.path(), "pkg", "ok.svg").is_ok());
     }
 }
