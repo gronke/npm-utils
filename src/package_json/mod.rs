@@ -321,6 +321,29 @@ impl PackageJson {
         best
     }
 
+    /// Whether the manifest declares an `exports` field. Per Node, `exports` *gates*
+    /// access: only the subpaths it maps are reachable, so a caller resolving an
+    /// arbitrary file must treat an unmatched subpath as refused
+    /// (`ERR_PACKAGE_PATH_NOT_EXPORTED`) rather than reaching past it.
+    pub fn has_exports(&self) -> bool {
+        self.raw.get("exports").is_some()
+    }
+
+    /// Resolve an arbitrary file `subpath` (e.g. `"icons/eye.svg"`; a leading `./`
+    /// is optional) to a package-relative path. With an `exports` field, only what
+    /// `exports` maps is reachable (via [`resolve_subpath`](Self::resolve_subpath));
+    /// without one, every file is addressable directly (Node's behavior for a
+    /// package that declares no `exports`), so the normalized subpath is returned.
+    /// `None` when `exports` gates the subpath out, or the path would escape the
+    /// package.
+    pub fn resolve_asset(&self, subpath: &str) -> Option<String> {
+        if self.has_exports() {
+            self.resolve_subpath(subpath)
+        } else {
+            safe_target(subpath)
+        }
+    }
+
     /// Enumerate the import-map-worthy entries: the bare entry, concrete subpaths,
     /// and `"./*"`-pattern prefixes.
     pub fn entries(&self) -> Vec<Entry> {
@@ -539,5 +562,31 @@ mod tests {
     fn rejects_path_traversal_targets() {
         let evil = PackageJson::from_json(r#"{"exports":{".":"../escape.js"}}"#).unwrap();
         assert!(evil.resolve_main().is_none());
+    }
+
+    #[test]
+    fn resolve_asset_gates_on_exports_else_addresses_directly() {
+        // No `exports`: any file is addressable directly (the bootstrap-icons shape).
+        let plain = PackageJson::from_json(r#"{"name":"bootstrap-icons","files":["icons/*.svg"]}"#)
+            .unwrap();
+        assert!(!plain.has_exports());
+        assert_eq!(
+            plain.resolve_asset("icons/eye.svg").as_deref(),
+            Some("icons/eye.svg")
+        );
+        assert_eq!(
+            plain.resolve_asset("./icons/eye.svg").as_deref(),
+            Some("icons/eye.svg")
+        );
+        assert!(plain.resolve_asset("../escape.svg").is_none());
+
+        // With `exports`: only mapped subpaths resolve; anything else is gated out.
+        let gated = PackageJson::from_json(r#"{"exports":{"./icons/*":"./icons/*.svg"}}"#).unwrap();
+        assert!(gated.has_exports());
+        assert_eq!(
+            gated.resolve_asset("icons/eye").as_deref(),
+            Some("icons/eye.svg")
+        );
+        assert!(gated.resolve_asset("secret/keys.json").is_none());
     }
 }
