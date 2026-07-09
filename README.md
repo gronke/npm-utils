@@ -22,7 +22,7 @@ Composable modules — the full API is on **[docs.rs](https://docs.rs/npm-utils)
 | `download` | Fetch over HTTPS with one retry and a 100 MB cap; build GitHub archive URLs. |
 | `extract` | Unpack `.tar.gz` / `.zip` — all files, an explicit file map, or a predicate — path-traversal-safe. |
 | `integrity` | Verify a tarball's `sha512` Subresource-Integrity before its bytes are trusted. |
-| `install` | Build a real `node_modules/`: resolve a `package.json` (`npm install`) or reproduce a `package-lock.json` exactly (`npm ci`), every tarball integrity-checked. |
+| `install` | Build a real `node_modules/`: resolve a `package.json` (`npm install`) or reproduce a `package-lock.json` exactly (`npm ci`), every tarball integrity-checked. Hoisted **workspaces** are reproduced too — member/`file:` links are symlinked into `node_modules/`. |
 | `package_json` | Parse `package.json` / `package-lock.json` and the npm version-spec grammar; write npm-faithful manifests and v3 locks. |
 | `sbom` | Render a committed lock as a license summary, CycloneDX 1.6, or SPDX 2.3. |
 | `audit` | Check a project, manifest/lockfile path, or `name=range` spec against vulnerability advisories (npm registry + OSV) behind a pluggable source trait. |
@@ -50,7 +50,8 @@ use std::path::Path;
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let project = Path::new("examples/app");
 npm_utils::install::from_lockfile(&project.join("package-lock.json"), project)?;
-// → project/node_modules/ populated + .bin shims; now run `node node_modules/.bin/tsc`.
+// → project/node_modules/ populated + .bin shims + workspace-member symlinks;
+//   now run `node node_modules/.bin/tsc`.
 # Ok(()) }
 ```
 
