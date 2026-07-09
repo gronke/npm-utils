@@ -13,13 +13,22 @@ use crate::registry::Resolved;
 /// — a pure-Rust, `npm ci`-faithful install.
 ///
 /// The lockfile (v2/v3) is parsed by [`crate::package_json::lock`]; this installs every registry-tarball
-/// entry whose `os`/`cpu` match the host (skipping links and off-platform optional deps like
+/// entry whose `os`/`cpu` match the host (skipping off-platform optional deps like
 /// darwin-only `fsevents` on Linux), verifies each `sha512` integrity, extracts it to the path the
 /// lockfile names, and creates `node_modules/.bin/` symlinks — so installed CLIs (`tsc`,
 /// `playwright`, …) run as under npm, with only the Node runtime, no `npm`. Skip-if-unchanged on
 /// the lockfile's content hash. A *failed* on-platform optional dependency (a download or verify
 /// error) is warned and skipped rather than aborting, as `npm ci` does. Returns the installed set
 /// — any skipped optional omitted — sorted by install path.
+///
+/// **Workspaces.** A `link: true` entry (an npm workspace member, or a `file:`
+/// dependency) is materialized as a relative symlink `node_modules/<name> →
+/// <target>`, matching npm's hoisted-workspace layout — so a `ci` at the
+/// workspace root wires every member into `node_modules/` without Node. Only a
+/// link whose target stays **within** `dest` is created; one that escapes (a
+/// `file:` dep pointing outside the project) is warned and skipped, matching
+/// this crate's traversal posture. Links are not part of the returned set (they
+/// carry no tarball/integrity), and, like the `.bin` shims, are Unix-only.
 pub fn from_lockfile(
     package_lock: &Path,
     dest: &Path,
@@ -41,6 +50,14 @@ pub(crate) fn from_lockfile_observed(
         .installable(std::env::consts::OS, std::env::consts::ARCH)
         .into_iter()
         .filter(|p| p.is_registry_tarball())
+        .collect();
+    // Workspace members / `file:` deps: link entries symlinked into node_modules
+    // (materialized after the tarball tree, since a link may sit under a scope
+    // dir that a registry install just created — or need its own).
+    let links: Vec<&LockedPackage> = lockfile
+        .packages
+        .iter()
+        .filter(|p| p.link && p.key.starts_with("node_modules/"))
         .collect();
     // The lockfile fully determines the tree, so its content hash is the cache key.
     let want = crate::cache::file_hash(package_lock)?;
@@ -76,6 +93,8 @@ pub(crate) fn from_lockfile_observed(
         let installed_pkgs: Vec<&LockedPackage> =
             installed_idx.iter().map(|&i| installable[i]).collect();
         link_bins(node_modules, &installed_pkgs)?;
+        // Wire workspace members / file: links into the tree.
+        link_locals(dest, &links)?;
         Ok(())
     })?;
 
@@ -175,6 +194,75 @@ fn link_bins(
     Ok(()) // `.bin` shims are Unix symlinks; skipped on other platforms
 }
 
+/// Materialize `link: true` entries — npm **workspace members** and `file:`
+/// dependencies — as relative symlinks `node_modules/<name> → <target>`, so a
+/// hoisted-workspace `ci` matches npm's layout. The target comes from the
+/// entry's `resolved` (a repo-relative path, or a `file:`-prefixed one); the
+/// symlink value is relative to the link's own parent (climbing back to `dest`
+/// then descending into the target), so the tree stays relocatable — matching
+/// the `.bin` shims.
+///
+/// Path-traversal-safe: the link *location* (`key`) and its *target* both pass
+/// through [`safe_join`], which rejects `..`/absolute components. A link whose
+/// target escapes `dest` (a `file:` dep pointing outside the project) is warned
+/// and skipped rather than symlinked out of the tree — more conservative than
+/// npm, matching this crate's posture. Unix only.
+#[cfg(unix)]
+fn link_locals(
+    dest: &Path,
+    links: &[&LockedPackage],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::symlink;
+
+    for pkg in links {
+        // The link target: `resolved` names it, `file:`-prefixed or bare. A
+        // link with no target is malformed — skip it rather than guess.
+        let Some(resolved) = pkg.resolved.as_deref() else {
+            crate::warn::warn(&format!("link `{}` has no target; skipping", pkg.key));
+            continue;
+        };
+        let target = resolved
+            .strip_prefix("file:")
+            .unwrap_or(resolved)
+            .trim_start_matches("./");
+
+        // Containment gates (both attacker-controlled from the lockfile): the
+        // link location must be a contained `node_modules/…` path, and the
+        // target must stay within `dest`. `safe_join` rejects `..`/absolute;
+        // an escaping target (e.g. a `file:` dep outside the project) is
+        // skipped, never symlinked out of the tree.
+        let link_abs = safe_join(dest, &pkg.key)?;
+        if safe_join(dest, target).is_err() {
+            crate::warn::warn(&format!(
+                "workspace link `{}` targets `{target}` outside the project; skipping",
+                pkg.key
+            ));
+            continue;
+        }
+
+        // Relative, relocatable link value: climb from the link's parent back
+        // to `dest` (one `..` per key segment above the leaf), then descend
+        // into the target. e.g. `node_modules/@s/x → modules/x` ⇒ `../../modules/x`.
+        let depth = pkg.key.split('/').filter(|s| !s.is_empty()).count() - 1;
+        let link_value = format!("{}{target}", "../".repeat(depth));
+
+        if let Some(parent) = link_abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(&link_abs); // idempotent
+        symlink(&link_value, &link_abs)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_locals(
+    _dest: &Path,
+    _links: &[&LockedPackage],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(()) // workspace/file: links are Unix symlinks; skipped on other platforms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +292,103 @@ mod tests {
                 .map(|(n, p)| (n.to_string(), p.to_string()))
                 .collect(),
         }
+    }
+
+    /// A `link: true` entry with a `resolved` target — for the workspace tests.
+    fn locked_link(key: &str, resolved: &str) -> LockedPackage {
+        LockedPackage {
+            name: key
+                .rsplit("node_modules/")
+                .next()
+                .unwrap_or(key)
+                .to_string(),
+            key: key.to_string(),
+            version: String::new(),
+            resolved: Some(resolved.to_string()),
+            integrity: None,
+            license: None,
+            dev: false,
+            optional: false,
+            dev_optional: false,
+            link: true,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            bin: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_locals_symlinks_members_relative_to_dest() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path();
+        // A scoped member (bare repo-relative target) and an unscoped one with a
+        // `file:` prefix — both inside the project.
+        let pkgs = [
+            locked_link("node_modules/@schuhkarton/assets-web", "modules/assets/web"),
+            locked_link("node_modules/plain", "file:packages/plain"),
+        ];
+        let links: Vec<&LockedPackage> = pkgs.iter().collect();
+        link_locals(dest, &links).unwrap();
+
+        // Scoped: two segments above dest (`node_modules/@schuhkarton/`) ⇒ `../../`.
+        assert_eq!(
+            std::fs::read_link(dest.join("node_modules/@schuhkarton/assets-web")).unwrap(),
+            Path::new("../../modules/assets/web")
+        );
+        // Unscoped: one segment above dest ⇒ `../`, and the `file:` prefix is stripped.
+        assert_eq!(
+            std::fs::read_link(dest.join("node_modules/plain")).unwrap(),
+            Path::new("../packages/plain")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_locals_skips_a_target_escaping_the_project() {
+        // A `file:` dep pointing outside `dest` must not become a symlink out of
+        // the tree — it is skipped, and nothing is created.
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path();
+        let pkgs = [locked_link("node_modules/outside", "file:../../../etc")];
+        let links: Vec<&LockedPackage> = pkgs.iter().collect();
+        link_locals(dest, &links).unwrap();
+        assert!(
+            !dest.join("node_modules/outside").exists()
+                && std::fs::symlink_metadata(dest.join("node_modules/outside")).is_err(),
+            "an escaping link target creates nothing"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_lockfile_materializes_a_workspace_link_offline() {
+        // A lockfile with only a workspace member (no tarballs) installs offline:
+        // the member is symlinked into node_modules, relative and relocatable.
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path();
+        std::fs::create_dir_all(dest.join("packages/member")).unwrap();
+        let lock = dest.join("package-lock.json");
+        std::fs::write(
+            &lock,
+            r#"{ "name": "root", "version": "1.0.0", "lockfileVersion": 3, "packages": {
+                "": { "name": "root", "version": "1.0.0" },
+                "packages/member": { "name": "@scope/member", "version": "1.0.0" },
+                "node_modules/@scope/member": { "resolved": "packages/member", "link": true }
+            } }"#,
+        )
+        .unwrap();
+
+        let installed = from_lockfile(&lock, dest).unwrap();
+        assert!(
+            installed.is_empty(),
+            "a link carries no tarball, so it is not in the installed set"
+        );
+        assert_eq!(
+            std::fs::read_link(dest.join("node_modules/@scope/member")).unwrap(),
+            Path::new("../../packages/member"),
+            "the workspace member is symlinked relative to dest"
+        );
     }
 
     #[test]
