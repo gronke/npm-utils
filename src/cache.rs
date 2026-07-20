@@ -123,10 +123,20 @@ pub fn write_marker(
 
 /// Remove and recreate a directory.
 ///
+/// A symlink at `dir` is unlinked, never followed: `exists()` resolves through links, so a
+/// *dangling* link would otherwise survive the wipe and `create_dir_all` would then create the
+/// link's target directory — outside the tree the caller means to confine extraction to.
+///
 /// Retries on `ENOTEMPTY` — observed under CI overlay/tmpfs filesystems where
 /// the final `rmdir` races with leftover dentries even after all children are
 /// gone. Linux returns 39, macOS/BSD return 66 — match both.
 pub fn clear_directory(dir: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if fs::symlink_metadata(dir)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        fs::remove_file(dir)?;
+    }
     if dir.exists() {
         let mut delay_ms: u64 = 50;
         let mut attempts = 0;
@@ -182,6 +192,44 @@ mod tests {
         clear_directory(&d).unwrap();
         assert!(d.exists());
         assert!(!dir_has_content(&d));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_directory_unlinks_a_dangling_symlink_instead_of_following_it() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        // A link whose target does not exist: `exists()` is false through it, so without the
+        // symlink check the wipe is skipped and `create_dir_all` creates the *target*.
+        let target = tmp.path().join("outside");
+        let link = tmp.path().join("dest");
+        symlink(&target, &link).unwrap();
+
+        clear_directory(&link).unwrap();
+        assert!(
+            !target.exists(),
+            "the link's target directory must not be created"
+        );
+        assert!(link.is_dir() && !link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_directory_replaces_a_live_symlink_with_a_real_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("real");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep"), b"x").unwrap();
+        let link = tmp.path().join("dest");
+        symlink(&target, &link).unwrap();
+
+        clear_directory(&link).unwrap();
+        assert!(link.is_dir() && !link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            target.join("keep").exists(),
+            "the link's target is left untouched"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 ### Security
 
 - download: the shared agent sets `https_only`, so the https scheme guard now covers every request in a redirect chain, not just the initial URL — a hostile or compromised endpoint can no longer steer a fetch to plain http by redirecting.
+- cache: `clear_directory` unlinks a symlink at its target instead of following it — a dangling link previously survived the wipe and `create_dir_all` then created the link's target directory outside the tree, anchoring the subsequent extraction there.
 
 ### Added
 
