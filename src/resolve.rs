@@ -18,7 +18,26 @@ use crate::Result;
 /// (Node's module-resolution order), returning the first directory that exists.
 /// `name` may be scoped (`@scope/pkg`). Errors when the package is installed nowhere
 /// on the way up — run `npm install` / `web-modules ci` first.
+///
+/// The ascent runs to the filesystem root: a same-named package in a `node_modules`
+/// **above** the project (a parent workspace, `~/node_modules`) is found and used.
+/// When the starting directory is untrusted, prefer [`package_dir_within`] to stop the
+/// ascent at the project boundary.
 pub fn package_dir(from_dir: &Path, name: &str) -> Result<PathBuf> {
+    package_dir_up(from_dir, name, None)
+}
+
+/// [`package_dir`], but the ascent stops at `boundary` (inclusive): a package installed
+/// only above it is not found. The boundary is canonicalized once; each candidate level is
+/// compared canonically, so a symlinked start directory cannot slip past it.
+pub fn package_dir_within(from_dir: &Path, name: &str, boundary: &Path) -> Result<PathBuf> {
+    let boundary = boundary.canonicalize().map_err(|e| -> crate::Error {
+        format!("resolve boundary {}: {e}", boundary.display()).into()
+    })?;
+    package_dir_up(from_dir, name, Some(&boundary))
+}
+
+fn package_dir_up(from_dir: &Path, name: &str, boundary: Option<&Path>) -> Result<PathBuf> {
     validate_package_name(name)?;
     let mut cursor = Some(from_dir);
     while let Some(dir) = cursor {
@@ -26,13 +45,16 @@ pub fn package_dir(from_dir: &Path, name: &str) -> Result<PathBuf> {
         if candidate.is_dir() {
             return Ok(candidate);
         }
+        if boundary.is_some_and(|b| dir.canonicalize().ok().as_deref() == Some(b)) {
+            break;
+        }
         cursor = dir.parent();
     }
-    Err(format!(
-        "package {name:?} is not installed in any node_modules above {}",
-        from_dir.display()
-    )
-    .into())
+    let scope = match boundary {
+        Some(b) => format!("between {} and {}", from_dir.display(), b.display()),
+        None => format!("above {}", from_dir.display()),
+    };
+    Err(format!("package {name:?} is not installed in any node_modules {scope}").into())
 }
 
 /// Resolve `<name>/<subpath>` to a real file inside the installed package.
@@ -42,8 +64,33 @@ pub fn package_dir(from_dir: &Path, name: &str) -> Result<PathBuf> {
 /// the file is addressed directly (Node's behavior for a package without `exports`,
 /// e.g. `bootstrap-icons`). The result is canonicalized and guaranteed to sit inside the
 /// package's real directory — an in-package symlink resolving outside it is refused.
+///
+/// The package lookup ascends to the filesystem root; see [`package_file_within`] for the
+/// bounded variant to use on untrusted trees.
 pub fn package_file(from_dir: &Path, name: &str, subpath: &str) -> Result<PathBuf> {
-    let dir = package_dir(from_dir, name)?;
+    package_file_up(from_dir, name, subpath, None)
+}
+
+/// [`package_file`], with the package lookup bounded at `boundary` ([`package_dir_within`]).
+pub fn package_file_within(
+    from_dir: &Path,
+    name: &str,
+    subpath: &str,
+    boundary: &Path,
+) -> Result<PathBuf> {
+    let boundary = boundary.canonicalize().map_err(|e| -> crate::Error {
+        format!("resolve boundary {}: {e}", boundary.display()).into()
+    })?;
+    package_file_up(from_dir, name, subpath, Some(&boundary))
+}
+
+fn package_file_up(
+    from_dir: &Path,
+    name: &str,
+    subpath: &str,
+    boundary: Option<&Path>,
+) -> Result<PathBuf> {
+    let dir = package_dir_up(from_dir, name, boundary)?;
     let manifest = dir.join("package.json");
     let relative = if manifest.is_file() {
         let package = PackageJson::from_path(&manifest)?;
@@ -170,6 +217,39 @@ mod tests {
         );
         let file = package_file(tmp.path(), "@scope/pkg", "a/b.svg").unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "x");
+    }
+
+    #[test]
+    fn package_dir_within_stops_the_ascent_at_the_boundary() {
+        let tmp = tempdir().unwrap();
+        // The package is installed at the tmp root; the project lives below it.
+        install(tmp.path(), "pkg", r#"{"name":"pkg"}"#, &[("a.svg", "x")]);
+        let project = tmp.path().join("project");
+        let deep = project.join("web/icons");
+        fs::create_dir_all(&deep).unwrap();
+
+        // Unbounded: found above the project (Node semantics).
+        assert!(package_dir(&deep, "pkg").is_ok());
+        // Bounded at the project: the same package is out of reach.
+        assert!(package_dir_within(&deep, "pkg", &project).is_err());
+        assert!(package_file_within(&deep, "pkg", "a.svg", &project).is_err());
+    }
+
+    #[test]
+    fn package_dir_within_checks_the_boundary_level_itself() {
+        let tmp = tempdir().unwrap();
+        // Installed *at* the boundary: inclusive, so it resolves.
+        let project = tmp.path().join("project");
+        install(&project, "pkg", r#"{"name":"pkg"}"#, &[("a.svg", "x")]);
+        let deep = project.join("web/icons");
+        fs::create_dir_all(&deep).unwrap();
+
+        assert!(package_dir_within(&deep, "pkg", &project).is_ok());
+        assert_eq!(
+            fs::read_to_string(package_file_within(&deep, "pkg", "a.svg", &project).unwrap())
+                .unwrap(),
+            "x"
+        );
     }
 
     #[test]

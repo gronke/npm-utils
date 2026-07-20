@@ -14,6 +14,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 
 ### Added
 
+- resolve: `package_dir_within` / `package_file_within` — the Node-style `node_modules` ascent bounded at a project directory, so a caller resolving on behalf of an untrusted tree can keep it from naming packages installed only above the project. The unbounded `package_dir` / `package_file` keep Node's semantics.
 - install: `from_lockfile` materializes workspace-member and `file:` links as relative symlinks under `node_modules/` — an `npm ci` for workspaces, still no Node. A link target escaping the project is warned and skipped; Unix only, like the `.bin` shims.
 - package_json: `set_field` and `remove_field` — the write-side of `npm pkg set` and `npm pkg delete` for plain top-level keys, so scaffold, `set_field` and `to_pretty` compose into assembling a publishable `package.json`.
 
