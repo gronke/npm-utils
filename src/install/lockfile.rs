@@ -62,6 +62,21 @@ pub(crate) fn from_lockfile_observed(
     // The lockfile fully determines the tree, so its content hash is the cache key.
     let want = crate::cache::file_hash(package_lock)?;
 
+    // A lockfile names each tarball's URL *and* the sha512 it is verified against, so on an
+    // untrusted lockfile the integrity check authenticates nothing. Make off-registry fetches
+    // visible: one warning per distinct non-default host before any download.
+    for host in installable
+        .iter()
+        .filter_map(|pkg| tarball_host(pkg.resolved.as_deref().unwrap_or_default()))
+        .filter(|host| *host != NPM_REGISTRY_HOST)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        crate::warn::warn(&format!(
+            "lockfile fetches tarballs from non-registry host `{host}` — \
+             the URL and the integrity it is verified against both come from the lockfile"
+        ));
+    }
+
     let mut installed_idx: Vec<usize> = Vec::new();
     let mut populated = false;
     super::run_install(dest, &want, |node_modules| {
@@ -125,6 +140,19 @@ pub(crate) fn from_lockfile_observed(
             })
         })
         .collect()
+}
+
+/// The host tarballs are expected from: the public npm registry. `from_lockfile` takes each
+/// entry's `resolved` verbatim (a private registry is a legitimate source), so other hosts are
+/// only warned about, not refused.
+const NPM_REGISTRY_HOST: &str = "registry.npmjs.org";
+
+/// The host part of an `https://host/…` tarball URL, lowercased; `None` for anything else
+/// (a non-https URL — refused later by the download guard — or a malformed one).
+fn tarball_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    Some(host.to_ascii_lowercase())
 }
 
 /// Create `node_modules/.bin/<name>` symlinks for every package `bin`, so the installed CLIs run
@@ -267,6 +295,22 @@ fn link_locals(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn tarball_host_extracts_https_hosts_only() {
+        assert_eq!(
+            tarball_host("https://registry.npmjs.org/lit/-/lit-3.3.3.tgz").as_deref(),
+            Some("registry.npmjs.org")
+        );
+        assert_eq!(
+            tarball_host("https://NPM.example.com:8443/x.tgz").as_deref(),
+            Some("npm.example.com:8443"),
+            "host comparison is case-insensitive"
+        );
+        assert_eq!(tarball_host("http://registry.npmjs.org/x.tgz"), None);
+        assert_eq!(tarball_host("not a url"), None);
+        assert_eq!(tarball_host(""), None);
+    }
 
     /// Build a `LockedPackage` for the `.bin` test — only `key`, `name`, and `bin` matter here.
     fn locked(key: &str, bin: &[(&str, &str)]) -> LockedPackage {
