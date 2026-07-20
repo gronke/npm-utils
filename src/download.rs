@@ -69,36 +69,42 @@ static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 fn agent() -> ureq::Agent {
     AGENT
-        .get_or_init(|| {
-            let t = timeouts();
-            ureq::Agent::new_with_config(
-                ureq::Agent::config_builder()
-                    .tls_config(
-                        TlsConfig::builder()
-                            .root_certs(RootCerts::PlatformVerifier)
-                            .build(),
-                    )
-                    .timeout_connect(t.connect)
-                    .timeout_global(t.global)
-                    // The resolver prefetches packuments 8-wide against a single registry host
-                    // (`registry`'s PACKUMENT_CONCURRENCY); ureq's idle-pool defaults (3 per
-                    // host, 10 total) would drop and re-handshake most of those connections
-                    // between rounds.
-                    .max_idle_connections_per_host(8)
-                    .max_idle_connections(16)
-                    .build(),
-            )
-        })
+        .get_or_init(|| ureq::Agent::new_with_config(agent_config(timeouts())))
         .clone()
+}
+
+/// The shared agent's configuration: platform-verified TLS, the process-wide timeouts, an idle
+/// pool sized for the resolver's 8-wide packument prefetch, and https on **every** request —
+/// redirects included.
+fn agent_config(t: Timeouts) -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .timeout_connect(t.connect)
+        .timeout_global(t.global)
+        // The resolver prefetches packuments 8-wide against a single registry host
+        // (`registry`'s PACKUMENT_CONCURRENCY); ureq's idle-pool defaults (3 per
+        // host, 10 total) would drop and re-handshake most of those connections
+        // between rounds.
+        .max_idle_connections_per_host(8)
+        .max_idle_connections(16)
+        // The scheme guard in `fetch_with_accept` checks only the initial URL; without
+        // this, a redirect could still steer the fetch to plain http.
+        .https_only(true)
+        .build()
 }
 
 /// Download an `https://` URL into memory (100 MB cap), retrying once on transient failure.
 ///
-/// Only `https` is fetched: a non-https URL is refused up front. The tarball URL is advertised
-/// by the registry, so this keeps a hostile or redirecting registry from steering us at a
-/// plain-http or internal endpoint (the downloaded bytes are sha512-verified regardless — this
-/// is defense-in-depth). Per-request connect and transfer timeouts are set so a stalled peer
-/// can't hang the build; the 100 MB cap bounds size, the timeouts bound time.
+/// Only `https` is fetched: a non-https URL is refused up front, and the agent refuses a
+/// redirect to one (`https_only`). The tarball URL is advertised by the registry, so this keeps
+/// a hostile or redirecting registry from steering us at a plain-http or internal endpoint (the
+/// downloaded bytes are sha512-verified regardless — this is defense-in-depth). Per-request
+/// connect and transfer timeouts are set so a stalled peer can't hang the build; the 100 MB cap
+/// bounds size, the timeouts bound time.
 ///
 /// Some hosts (GitHub in particular) occasionally drop a connection
 /// mid-transfer — observed as `io: Peer disconnected` on CI — and the same URL
@@ -226,6 +232,13 @@ mod tests {
                 "{url:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_agent_refuses_redirects_off_https() {
+        // `https_only` applies the scheme guard to every request in a redirect chain, not just
+        // the initial URL `fetch_with_accept` checks.
+        assert!(agent_config(Timeouts::default()).https_only());
     }
 
     #[test]
