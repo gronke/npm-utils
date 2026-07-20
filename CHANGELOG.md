@@ -5,6 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 
 ## [Unreleased]
 
+### Security
+
+- download: the shared agent sets `https_only`, so the https scheme guard now covers every request in a redirect chain, not just the initial URL — a hostile or compromised endpoint can no longer steer a fetch to plain http by redirecting.
+
 ### Added
 
 - install: `from_lockfile` materializes workspace-member and `file:` links as relative symlinks under `node_modules/` — an `npm ci` for workspaces, still no Node. A link target escaping the project is warned and skipped; Unix only, like the `.bin` shims.
