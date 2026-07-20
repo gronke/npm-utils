@@ -8,6 +8,9 @@
 //! Key order is npm-faithful only because the crate enables `serde_json`'s `preserve_order`
 //! feature: a parsed object keeps the user's field order on re-serialize, and [`dependencies`] is
 //! re-sorted alphabetically the way npm does on save.
+//!
+//! [`scaffold`] + [`set_field`] + [`to_pretty`] compose into manifest assembly — the path a code
+//! generator takes to emit a publishable `package.json` without hand-rolling JSON.
 
 use serde_json::{Map, Value};
 
@@ -18,6 +21,26 @@ pub fn scaffold(name: &str, version: &str) -> Value {
     obj.insert("version".into(), Value::String(version.to_string()));
     obj.insert("dependencies".into(), Value::Object(Map::new()));
     Value::Object(obj)
+}
+
+/// Set a top-level manifest field to `value` in place, replacing any existing value — the
+/// write-side of npm's `npm pkg set <key>=<value>` for plain (undotted) keys. A new field
+/// appends after the existing ones (`preserve_order`), so assembling a publishable manifest
+/// reads top to bottom: [`scaffold`], then one `set_field` per field, then [`to_pretty`].
+/// A no-op if `doc` is not a JSON object (a malformed `package.json` the caller should have
+/// rejected).
+pub fn set_field(doc: &mut Value, key: &str, value: Value) {
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+}
+
+/// Remove a top-level manifest field, returning whether it was present — the write-side of
+/// npm's `npm pkg delete <key>` for plain keys, and [`set_field`]'s counterpart. A no-op
+/// returning `false` when `doc` is not an object or the key is absent.
+pub fn remove_field(doc: &mut Value, key: &str) -> bool {
+    doc.as_object_mut()
+        .is_some_and(|obj| obj.remove(key).is_some())
 }
 
 /// Add or update `dependencies[name] = range` in place, then re-sort the `dependencies` object
@@ -111,6 +134,56 @@ mod tests {
         assert_eq!(doc["name"], "my-app");
         assert_eq!(doc["version"], "1.0.0");
         assert!(doc["dependencies"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_field_assembles_a_publishable_manifest() {
+        // The assembly path a code generator takes: scaffold, then one set_field per field.
+        // Fields append in call order (preserve_order), and a re-set replaces in place.
+        let mut doc = scaffold("@scope/pkg", "1.0.0");
+        set_field(&mut doc, "license", serde_json::json!("MIT"));
+        set_field(&mut doc, "type", serde_json::json!("module"));
+        set_field(&mut doc, "exports", serde_json::json!({".": "./index.js"}));
+        set_field(&mut doc, "files", serde_json::json!(["index.js"]));
+
+        let keys: Vec<String> = doc.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            [
+                "name",
+                "version",
+                "dependencies",
+                "license",
+                "type",
+                "exports",
+                "files"
+            ]
+        );
+        assert_eq!(doc["exports"]["."], "./index.js");
+
+        set_field(&mut doc, "license", serde_json::json!("Apache-2.0"));
+        assert_eq!(doc["license"], "Apache-2.0");
+        // A replaced value keeps its field position.
+        let keys_after: Vec<String> = doc.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, keys_after);
+    }
+
+    #[test]
+    fn set_field_is_a_no_op_on_a_malformed_document() {
+        let mut doc = Value::String("not an object".into());
+        set_field(&mut doc, "license", serde_json::json!("MIT"));
+        assert_eq!(doc, Value::String("not an object".into()));
+    }
+
+    #[test]
+    fn remove_field_drops_the_key_and_reports_presence() {
+        let mut doc = scaffold("app", "1.0.0");
+        set_field(&mut doc, "private", serde_json::json!(true));
+        assert!(remove_field(&mut doc, "private"));
+        assert!(doc.get("private").is_none());
+        assert!(!remove_field(&mut doc, "private"));
+        let mut malformed = Value::String("not an object".into());
+        assert!(!remove_field(&mut malformed, "anything"));
     }
 
     #[test]
