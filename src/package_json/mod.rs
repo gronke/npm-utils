@@ -109,7 +109,11 @@ pub fn parse_dependencies(
 
 /// Reject npm package names whose characters could escape a path or URL — a path-safety allowlist,
 /// not a spec validator. Allowed: ASCII alphanumerics plus `.`, `_`, `-`, `@`, and `/` (scoped);
-/// empty, over-long, and any `..` are rejected. Case is intentionally *not* restricted: npm steers
+/// empty, over-long, and any `..` are rejected. So is any empty `/`-separated segment — a leading
+/// `/` would make `Path::join(name)` replace its base with an absolute path, and a trailing or
+/// doubled `/` smuggles empty components into layouts that assume a name is one or two segments —
+/// and the exact name `.`, which addresses a directory rather than a package. Case is
+/// intentionally *not* restricted: npm steers
 /// new packages to lowercase, but the registry still hosts legacy mixed-case names, and a truly
 /// invalid name simply 404s — enforcing case here would only reject valid installs. Anything
 /// outside the allowlist is a typo or a crafted entry meant to traverse a path later — fail loudly.
@@ -122,6 +126,9 @@ pub(crate) fn validate_package_name(
     }
     if name.contains("..") {
         return Err(format!("package name {name:?} contains '..'").into());
+    }
+    if name == "." || name.split('/').any(|segment| segment.is_empty()) {
+        return Err(format!("package name {name:?} is not a relative name").into());
     }
     if !name
         .bytes()
@@ -451,6 +458,29 @@ fn target_dir(target: &str) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn package_names_are_confined_to_relative_segments() {
+        for valid in ["lit", "@scope/pkg", "MixedCase", "a.b-c_d"] {
+            assert!(validate_package_name(valid).is_ok(), "{valid:?}");
+        }
+        // A leading `/` joins as an absolute path; `.`/`..` and empty segments address
+        // directories rather than packages.
+        for invalid in [
+            "/etc",
+            "/",
+            ".",
+            "..",
+            "@scope/",
+            "@//pkg",
+            "a//b",
+            "pkg/",
+            "../x",
+            "a..b/../c",
+        ] {
+            assert!(validate_package_name(invalid).is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn parses_pinned_caret_and_git_specs() {
