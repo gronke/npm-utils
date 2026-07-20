@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    branches: ["release/v**"]
+    tags: ["v*"]
+  workflow_dispatch: # cut-release dispatches the first run explicitly
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    name: release readiness gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.expect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Derive the expected version from the ref
+        id: expect
+        run: |
+          set -euo pipefail
+          # A v* tag keeps its full version. Only human-pushed final tags reach the
+          # pipeline; workflow-token marker pushes trigger nothing.
+          case "${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" in
+            branch:release/v*) version="${GITHUB_REF_NAME#release/v}" ;;
+            tag:v*)            version="${GITHUB_REF_NAME#v}" ;;
+            *)                 version="" ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Require a verified signed tag (final path only)
+        if: github.ref_type == 'tag'
+        uses: gronke/rust-ci/.github/actions/require-signed-tag@v1.1.0
+
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
+        with:
+          toolchain: stable
+
+      # Tag/version coherence, cargo publish --dry-run, and not-already-on-crates.io.
+      - uses: gronke/rust-ci/.github/actions/check-release-readiness@v1.1.0
+        with:
+          package: npm-utils
+          expected-version: ${{ steps.expect.outputs.version }}
+
+  draft:
+    name: build the draft pre-release (candidate path)
+    needs: gate
+    # Only release branches build candidates: a workflow_dispatch from any other
+    # branch derives no version and must not create a draft.
+    if: github.ref_type == 'branch' && startsWith(github.ref_name, 'release/v')
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Renders the released changelog section as release-notes.md — the draft body
+      # and the marker/tag message; the title leads it so the signed tag's subject
+      # is the version. Uncomment when a rust-ci release ships the notes mode.
+      # - uses: gronke/rust-ci/.github/actions/changelog@vNEXT
+      #   with:
+      #     mode: notes
+      #     version: ${{ env.VERSION }}
+      #     title: v${{ env.VERSION }}
+
+      - name: Create or refresh the draft pre-release
+        run: |
+          set -euo pipefail
+          notes=(--notes "Release v${VERSION}.")
+          [ -s release-notes.md ] && notes=(--notes-file release-notes.md)
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release edit "v${VERSION}" "${notes[@]}"
+          else
+            gh release create "v${VERSION}" --draft --prerelease --title "v${VERSION}" "${notes[@]}"
+          fi
+
+      - name: Advance the candidate marker tag
+        id: marker
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          n=1
+          while gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}-rc${n}" >/dev/null 2>&1; do
+            n=$((n + 1))
+          done
+          # The marker's message is release-notes.md when present (so promoting a
+          # candidate copies it into the signed tag), else a bare candidate label.
+          if [ -s release-notes.md ]; then
+            git tag -a -F release-notes.md "v${VERSION}-rc${n}" "${GITHUB_SHA}"
+          else
+            git tag -a -m "v${VERSION} candidate ${n}" "v${VERSION}-rc${n}" "${GITHUB_SHA}"
+          fi
+          git push origin "refs/tags/v${VERSION}-rc${n}"
+          echo "marker=v${VERSION}-rc${n}" >> "$GITHUB_OUTPUT"
+
+      - uses: gronke/rust-ci/.github/actions/release-guidance@v1.1.0
+        with:
+          version: ${{ env.VERSION }}
+          marker-tag: ${{ steps.marker.outputs.marker }}
+          commit: ${{ github.sha }}
+
+  publish:
+    name: publish the release (final path)
+    needs: gate
+    # Any tag reaching the pipeline is a human-pushed final tag: marker tags are
+    # pushed with the workflow token and trigger nothing, and require-signed-tag
+    # rejects unsigned tags.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release # add required reviewers here for a human pause
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag must seal the newest candidate marker
+        run: |
+          set -euo pipefail
+          n=1
+          while gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}-rc$((n + 1))" >/dev/null 2>&1; do
+            n=$((n + 1))
+          done
+          marker_commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}-rc${n}" --jq '.object.sha')"
+          marker_commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${marker_commit}" --jq '.object.sha' 2>/dev/null || printf '%s' "$marker_commit")"
+          if [ "$marker_commit" != "$GITHUB_SHA" ]; then
+            echo "::error::v${VERSION} points at ${GITHUB_SHA} but the last build (v${VERSION}-rc${n}) is ${marker_commit}"
+            exit 1
+          fi
+
+      # Publication is the irreversible step: the draft flips live, the tag name is
+      # consumed. cargo publish to crates.io stays a manual, deliberate step after.
+      - name: Publish
+        run: gh release edit "v${VERSION}" --draft=false

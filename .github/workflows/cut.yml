@@ -1,0 +1,31 @@
+name: Cut release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # push the release branch
+  pull-requests: write   # open the merge-back pull request
+  actions: write         # dispatch the release pipeline
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The changelog baseline and the merge-back need history and tags.
+          fetch-depth: 0
+
+      # cargo metadata resolves the crate version; the toolchain is the runner's default.
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
+        with:
+          toolchain: stable
+
+      # Rewrites [Unreleased] into the released section for the version Cargo.toml
+      # declares, pushes release/vX.Y.Z, opens the merge-back pull request, and
+      # dispatches release.yml on the branch. Refuses an empty [Unreleased] section
+      # and an existing release branch.
+      - uses: gronke/rust-ci/.github/actions/cut-release@v1.1.0
+        with:
+          package: npm-utils
