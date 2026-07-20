@@ -172,6 +172,15 @@ mod tests {
         assert_eq!(fs::read_to_string(file).unwrap(), "x");
     }
 
+    #[test]
+    fn package_dir_refuses_an_absolute_name_before_touching_the_disk() {
+        // `Path::join` with an absolute name would replace the base — the name guard
+        // fires first, so `/etc` is a validation error, not a lookup.
+        let tmp = tempdir().unwrap();
+        assert!(package_dir(tmp.path(), "/etc").is_err());
+        assert!(package_file(tmp.path(), "/", "etc/passwd").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn package_file_refuses_an_in_package_symlink_that_escapes() {
