@@ -17,8 +17,8 @@
 //!   [`spec::version_req`].
 //! - [`lock`] — `package-lock.json` (v2/v3) parsing into a faithful [`lock::Lockfile`], and
 //!   [`lock::render_v3`] for emitting one.
-//! - [`manifest`] — pure write-side `package.json` transforms (scaffold / upsert a dependency)
-//!   for the CLI's `init`/`add`.
+//! - [`manifest`] — pure write-side `package.json` transforms (scaffold / set a field /
+//!   upsert a dependency) for the CLI's `init`/`add` and for assembling a publishable manifest.
 
 pub mod lock;
 pub mod manifest;
