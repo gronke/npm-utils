@@ -29,18 +29,18 @@ jobs:
       - uses: actions/checkout@v7
 
       # Reusable Rust CI actions from gronke/rust-ci, pinned to a release tag.
-      - uses: gronke/rust-ci/.github/actions/install-toolchain@v0.0.3
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
         with:
           toolchain: stable
           components: rustfmt clippy
 
-      - uses: gronke/rust-ci/.github/actions/rust-cache@v0.0.3
+      - uses: gronke/rust-ci/.github/actions/rust-cache@v1.1.0
         with:
           prefix: ${{ matrix.name }}
 
       # fmt (once) + clippy (`--workspace --all-targets -D warnings`) + test (`--workspace`) for this
       # feature universe.
-      - uses: gronke/rust-ci/.github/actions/lint-and-test@v0.0.3
+      - uses: gronke/rust-ci/.github/actions/lint-and-test@v1.1.0
         with:
           features: ${{ matrix.features }}
           fmt: ${{ matrix.fmt }}
@@ -50,6 +50,27 @@ jobs:
       - name: Spec tests (package_json)
         if: matrix.name == 'all-features'
         run: "cargo test -p npm-utils package_json::"
+
+  changelog:
+    name: changelog check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The check derives its version baseline from the greatest vX.Y.Z tag.
+          fetch-depth: 0
+
+      # cargo metadata resolves the crate version; the toolchain is the runner's default.
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
+        with:
+          toolchain: stable
+
+      # Entries under [Unreleased] require the crate version to exceed the last
+      # release; a **Breaking:** entry requires more than a patch bump.
+      - uses: gronke/rust-ci/.github/actions/changelog@v1.1.0
+        with:
+          mode: check
+          package: npm-utils
 
   msrv:
     name: build on MSRV (1.88)
@@ -71,11 +92,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: gronke/rust-ci/.github/actions/install-toolchain@v0.0.3
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
         with:
           toolchain: stable
 
-      - uses: gronke/rust-ci/.github/actions/rust-cache@v0.0.3
+      - uses: gronke/rust-ci/.github/actions/rust-cache@v1.1.0
         with:
           prefix: package
 
