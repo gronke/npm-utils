@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - download: the shared agent sets `https_only`, so the https scheme guard now covers every request in a redirect chain, not just the initial URL — a hostile or compromised endpoint can no longer steer a fetch to plain http by redirecting.
 - cache: `clear_directory` unlinks a symlink at its target instead of following it — a dangling link previously survived the wipe and `create_dir_all` then created the link's target directory outside the tree, anchoring the subsequent extraction there.
 - package_json: `validate_package_name` rejects a leading `/`, empty `/`-separated segments, and the exact name `.` — an absolute name made `Path::join` replace its base, so `package_dir(from, "/etc")` resolved outside any `node_modules`.
+- install: `from_lockfile` warns once per distinct tarball host that is not `registry.npmjs.org` — a lockfile names each tarball's URL and the sha512 it is verified against, so on an untrusted lockfile the integrity check authenticates nothing and off-registry fetches must be visible.
 
 ### Added
 
