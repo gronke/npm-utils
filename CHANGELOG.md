@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com); releases are cut from the `[Unreleased]` section by `gronke/rust-ci`'s `changelog` action.
 
-## [Unreleased]
+## [0.6.2] - 2026-07-22
 
 ### Security
 
@@ -144,7 +144,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - cache: content-hash markers, a cross-process build lock, and skip-if-unchanged directory helpers.
 - package_json: read pinned dependency versions from `package.json`.
 
-[Unreleased]: https://github.com/gronke/npm-utils/compare/v0.6.1...HEAD
+[0.6.2]: https://github.com/gronke/npm-utils/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gronke/npm-utils/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gronke/npm-utils/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/gronke/npm-utils/compare/v0.5.2...v0.5.3
