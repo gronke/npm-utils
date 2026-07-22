@@ -17,6 +17,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - resolve: `package_dir_within` / `package_file_within` — the Node-style `node_modules` ascent bounded at a project directory, so a caller resolving on behalf of an untrusted tree can keep it from naming packages installed only above the project. The unbounded `package_dir` / `package_file` keep Node's semantics.
 - install: `from_lockfile` materializes workspace-member and `file:` links as relative symlinks under `node_modules/` — an `npm ci` for workspaces, still no Node. A link target escaping the project is warned and skipped; Unix only, like the `.bin` shims.
 - package_json: `set_field` and `remove_field` — the write-side of `npm pkg set` and `npm pkg delete` for plain top-level keys, so scaffold, `set_field` and `to_pretty` compose into assembling a publishable `package.json`.
+- resolve: `package_dir_within` and `package_file_within` bound the `node_modules` ascent at a caller-given boundary, compared canonically at each level.
+
+### Security
+
+- download: redirects follow on https only — the scheme guard covered just the initial URL, and a later hop could downgrade to plain http.
+- cache: `clear_directory` unlinks a symlink at its target first — a dangling link survived the wipe and anchored extraction outside the tree.
+- package_json: absolute and dot package names are rejected — a leading `/` made `Path::join` replace its base and resolve outside any `node_modules`.
+- install: one warning per distinct off-registry tarball host before any download — on an untrusted lockfile the sha512 check authenticates nothing; private registries keep working.
 
 ## [0.6.1] - 2026-07-06
 
