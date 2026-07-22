@@ -94,7 +94,10 @@ jobs:
           else
             git tag -a -m "v${VERSION} candidate ${n}" "v${VERSION}-rc${n}" "${GITHUB_SHA}"
           fi
-          git push origin "refs/tags/v${VERSION}-rc${n}"
+          git push origin "refs/tags/v${VERSION}-rc${n}" || {
+            echo "::error::the marker push was rejected (GH013) — the tag ruleset must let Actions create unsigned v*-rc* markers: exclude v*-rc* from creation-restricting and signature-requiring tag rules."
+            exit 1
+          }
           echo "marker=v${VERSION}-rc${n}" >> "$GITHUB_OUTPUT"
 
       - uses: gronke/rust-ci/.github/actions/release-guidance@v1.1.0
