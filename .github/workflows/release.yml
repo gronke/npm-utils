@@ -32,14 +32,14 @@ jobs:
 
       - name: Require a verified signed tag (final path only)
         if: github.ref_type == 'tag'
-        uses: gronke/rust-ci/.github/actions/require-signed-tag@v1.1.0
+        uses: gronke/rust-ci/.github/actions/require-signed-tag@v1.2.0
 
-      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.2.0
         with:
           toolchain: stable
 
       # Tag/version coherence, cargo publish --dry-run, and not-already-on-crates.io.
-      - uses: gronke/rust-ci/.github/actions/check-release-readiness@v1.1.0
+      - uses: gronke/rust-ci/.github/actions/check-release-readiness@v1.2.0
         with:
           package: npm-utils
           expected-version: ${{ steps.expect.outputs.version }}
@@ -57,14 +57,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Renders the released changelog section as release-notes.md — the draft body
-      # and the marker/tag message; the title leads it so the signed tag's subject
-      # is the version. Uncomment when a rust-ci release ships the notes mode.
-      # - uses: gronke/rust-ci/.github/actions/changelog@vNEXT
-      #   with:
-      #     mode: notes
-      #     version: ${{ env.VERSION }}
-      #     title: v${{ env.VERSION }}
+      # The released changelog section becomes release-notes.md — the draft body
+      # and the marker/tag message; the title leads it so the signed tag's
+      # subject is the version.
+      - uses: gronke/rust-ci/.github/actions/changelog@v1.2.0
+        with:
+          mode: notes
+          version: ${{ env.VERSION }}
+          title: v${{ env.VERSION }}
 
       - name: Create or refresh the draft pre-release
         run: |
@@ -100,7 +100,7 @@ jobs:
           }
           echo "marker=v${VERSION}-rc${n}" >> "$GITHUB_OUTPUT"
 
-      - uses: gronke/rust-ci/.github/actions/release-guidance@v1.1.0
+      - uses: gronke/rust-ci/.github/actions/release-guidance@v1.2.0
         with:
           version: ${{ env.VERSION }}
           marker-tag: ${{ steps.marker.outputs.marker }}
@@ -129,8 +129,13 @@ jobs:
           done
           marker_commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}-rc${n}" --jq '.object.sha')"
           marker_commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${marker_commit}" --jq '.object.sha' 2>/dev/null || printf '%s' "$marker_commit")"
-          if [ "$marker_commit" != "$GITHUB_SHA" ]; then
-            echo "::error::v${VERSION} points at ${GITHUB_SHA} but the last build (v${VERSION}-rc${n}) is ${marker_commit}"
+          # The seal is the content, not the commit: a rebase-merged merge-back
+          # rewrites the SHA but carries the identical tree, and that tip is a
+          # valid tag target. Trees resolve through the API — no history needed.
+          tag_tree="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.tree.sha')"
+          marker_tree="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${marker_commit}" --jq '.commit.tree.sha')"
+          if [ "$tag_tree" != "$marker_tree" ]; then
+            echo "::error::v${VERSION} (${GITHUB_SHA}, tree ${tag_tree}) does not carry the content the last build sealed (v${VERSION}-rc${n} at ${marker_commit}, tree ${marker_tree})"
             exit 1
           fi
 
