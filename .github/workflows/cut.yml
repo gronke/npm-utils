@@ -18,7 +18,7 @@ jobs:
           fetch-depth: 0
 
       # cargo metadata resolves the crate version; the toolchain is the runner's default.
-      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.2.0
         with:
           toolchain: stable
 
@@ -26,6 +26,6 @@ jobs:
       # declares, pushes release/vX.Y.Z, opens the merge-back pull request, and
       # dispatches release.yml on the branch. Refuses an empty [Unreleased] section
       # and an existing release branch.
-      - uses: gronke/rust-ci/.github/actions/cut-release@v1.1.0
+      - uses: gronke/rust-ci/.github/actions/cut-release@v1.2.0
         with:
           package: npm-utils
