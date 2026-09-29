@@ -12,7 +12,7 @@ permissions:
 jobs:
   gate:
     name: release readiness gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}
     outputs:
       version: ${{ steps.expect.outputs.version }}
     steps:
@@ -50,7 +50,7 @@ jobs:
     # Only release branches build candidates: a workflow_dispatch from any other
     # branch derives no version and must not create a draft.
     if: github.ref_type == 'branch' && startsWith(github.ref_name, 'release/v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}
     env:
       VERSION: ${{ needs.gate.outputs.version }}
       GH_TOKEN: ${{ github.token }}
@@ -113,7 +113,7 @@ jobs:
     # pushed with the workflow token and trigger nothing, and require-signed-tag
     # rejects unsigned tags.
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}
     environment: release # add required reviewers here for a human pause
     env:
       VERSION: ${{ needs.gate.outputs.version }}
