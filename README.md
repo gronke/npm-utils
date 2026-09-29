@@ -4,7 +4,7 @@ Pure-Rust utilities for the **npm registry** and web assets — resolve a packag
 No Node or npm at build time; just `ureq` + archive extraction.
 Handy from a `build.rs` to vendor browser/JS dependencies into your own asset tree.
 
-It's both a **library** (the modules below) and an optional **command-line tool** — a pure-Rust subset of npm's verbs (`install` / `add` / `ci` / `sbom` / …).
+It's both a **library** (the modules below) and an optional **command-line tool** — a pure-Rust subset of npm's verbs (`install` / `add` / `ci` / `pack` / `sbom` / …).
 See [CLI](#cli).
 
 ## Library
@@ -25,6 +25,7 @@ Composable modules — the full API is on **[docs.rs](https://docs.rs/npm-utils)
 | `install` | Build a real `node_modules/`: resolve a `package.json` (`npm install`) or reproduce a `package-lock.json` exactly (`npm ci`), every tarball integrity-checked. Hoisted **workspaces** are reproduced too — member/`file:` links are symlinked into `node_modules/`. |
 | `package_json` | Parse `package.json` / `package-lock.json` and the npm version-spec grammar; write npm-faithful manifests and v3 locks. |
 | `sbom` | Render a committed lock as a license summary, CycloneDX 1.6, or SPDX 2.3. |
+| `pack` | A pure-Rust local packer pinned to npm 12's file selection: ordered `files` globs, `.npmignore`/`.gitignore`, the always-in and always-out sets, `package/`-prefixed entries with npm's mtime and modes, streamed with sha1 shasum and sha512 integrity. |
 | `audit` | Check a project, manifest/lockfile path, or `name=range` spec against vulnerability advisories (npm registry + OSV) behind a pluggable source trait. |
 | `cache` | Content-hash markers and a cross-process lock for skip-if-unchanged downloads. |
 | `path_safety` | The traversal/symlink hardening shared by `extract` and `install`. |
@@ -99,7 +100,7 @@ That installs two binaries — `npm-utils` and `cargo-npm-utils` — so every ve
 
 ```console
 $ npm-utils --help
-Pure-Rust npm registry tools: install · ci · add · remove · init · upgrade · search · sbom · audit
+Pure-Rust npm registry tools: install, ci, add, remove, init, upgrade, resolve, download, search, pack, sbom, audit
 
 Usage: npm-utils [OPTIONS] <COMMAND>
 
@@ -113,6 +114,7 @@ Commands:
   resolve   Print the newest version matching a range (version, tarball, integrity)
   download  Download a package tarball — resolve and fetch, no install
   search    Search the registry for packages (npm search)
+  pack      List the files a package directory would publish and write its tarball (npm pack)
   sbom      Bill of materials from package-lock.json: license summary, CycloneDX, or SPDX
   audit     Check packages against vulnerability advisories (npm audit)
   help      Print this message or the help of the given subcommand(s)
@@ -132,7 +134,7 @@ Options:
           - on:      Live rendering even when stderr is piped
           - verbose: One terminated line per event — logfile-friendly, no control characters
           - none:    No status output (npm-utils: warnings and errors still print)
-
+          
           [default: auto]
 
   -q, --quiet
@@ -203,6 +205,23 @@ $ npm-utils audit lit=^3                      # a package and its full transitiv
 
 A finding at or above `--audit-level` exits `1`, and an **incomplete** audit — failed advisory sources or unaudited dependencies — fails closed with exit `2` unless `--allow-incomplete`.
 [docs/audit.md](docs/audit.md) covers the details: source spellings, the in-memory nested resolution, omissions, and the full exit and flag semantics.
+
+### Packing
+
+`pack` is a pure-Rust local package packer: npm-packlist file selection pinned to npm 12.1.0 by a recorded fixture, and npm's tarball layout.
+`files` entries expand as ordered globs and silence the root ignore files; else `.npmignore` (else `.gitignore`) applies, nested ignore files below, with minimatch's full grammar (`**`, classes, extglobs like `*.@(pem|key)`, braces).
+`package.json`, `README*`, `LICENSE*` and the `main`, `browser` and `bin` targets always ship; `.git`, `node_modules`, `.npmrc`, lockfiles, `.npm-extension.*` and `patchedDependencies` patch files never do.
+Lifecycle scripts never run; workspaces and package specs are out of scope, and a manifest declaring bundled dependencies is refused.
+
+```console
+$ npm-utils pack web/ --dry-run --json          # npm 12's report, keyed by package name; nothing written
+$ npm-utils pack web/ --pack-destination dist/  # streams dist/<name>-<version>.tgz
+```
+
+The tarball is pacote's layout: `package/`-prefixed regular files in packlist order, npm's fixed mtime, node-tar's portable modes with the bins executable, gzip level 9, streamed and hashed (`pack::write` takes any writer).
+The listing is frozen before any output exists and the destination is replaced only on success, so `pack .` never packs its own output and a failed pack keeps the previous artifact.
+The digests describe this crate's gzip stream; installers accept it like npm's.
+[docs/pack.md](docs/pack.md) states the rules in full.
 
 ### Progress output
 

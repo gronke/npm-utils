@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com); releases are cut from the `[Unreleased]` section by `gronke/rust-ci`'s `changelog` action.
 
+## [Unreleased]
+
+### Added
+
+- pack: a pure-Rust local package packer as `npm_utils::pack` and the `pack` verb: npm-packlist 11.3.0 file selection pinned by a recorded npm 12.1.0 fixture, pacote's tarball layout streamed through a hashing writer, npm 12's `--json` shape.
+- pack: `.npmrc`, VCS metadata, `node_modules`, root lockfiles, a root `.npm-extension.*` and the patch files of `patchedDependencies` never ship, whatever the manifest says; hostile ignore rules and deep trees fail with an error naming the input.
+- pack: lifecycle scripts, workspaces and package specs are out of scope; a manifest declaring bundled dependencies is refused.
+
 ## [0.6.2] - 2026-07-22
 
 ### Security
