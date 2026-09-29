@@ -17,6 +17,7 @@
 //! - `upgrade` — re-resolve within ranges, refresh the lock, install (= `npm update`).
 //! - `resolve` / `download` — thin registry probes (print a resolution / fetch a tarball).
 //! - `search` — query the registry and print matching packages (= `npm search`).
+//! - `pack`: list the files a package directory publishes and write their tarball (= `npm pack`).
 //!
 //! The library does the heavy lifting ([`crate::registry`], [`crate::install`], [`crate::project`],
 //! and the [`crate::package_json`] manifest/lock writers); this module is the argument parsing + the
@@ -38,6 +39,7 @@ mod common;
 mod download;
 mod init;
 mod install;
+mod pack;
 mod progress;
 mod remove;
 mod resolve;
@@ -53,7 +55,7 @@ pub(crate) type Res<T = ()> = crate::Result<T>;
 #[command(
     name = "npm-utils",
     version,
-    about = "Pure-Rust npm registry tools: install · ci · add · remove · init · upgrade · search · sbom · audit"
+    about = "Pure-Rust npm registry tools: install · ci · add · remove · init · upgrade · search · pack · sbom · audit"
 )]
 struct Cli {
     /// Per-fetch timeout in seconds (default 120) — caps each registry/tarball request, not the whole run
@@ -197,6 +199,21 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// List the files a package directory would publish and write its tarball (npm pack)
+    Pack {
+        /// The package directory (its package.json names and versions the tarball)
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Report only, write no tarball
+        #[arg(long)]
+        dry_run: bool,
+        /// Print npm's `pack --json` report on stdout instead of the notice block
+        #[arg(long)]
+        json: bool,
+        /// Directory the tarball is written to (default: the current directory)
+        #[arg(long, value_name = "DIR")]
+        pack_destination: Option<PathBuf>,
+    },
     /// Bill of materials from package-lock.json: license summary, CycloneDX, or SPDX
     Sbom {
         /// Project directory containing package-lock.json
@@ -286,6 +303,12 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             download::run(&name, &range, out.as_deref(), &progress)
         }
         Command::Search { query, limit } => search::run(&query.join(" "), limit),
+        Command::Pack {
+            dir,
+            dry_run,
+            json,
+            pack_destination,
+        } => pack::run(&dir, dry_run, json, pack_destination.as_deref()),
         Command::Sbom {
             dir,
             format,
@@ -382,6 +405,9 @@ mod tests {
             osv(&["npm-utils", "download", "ms", "--out", "/tmp/ms.tgz"]),
             osv(&["npm-utils", "search", "lodash"]),
             osv(&["npm-utils", "search", "react", "router", "--limit", "5"]),
+            osv(&["npm-utils", "pack"]),
+            osv(&["npm-utils", "pack", "web", "--dry-run", "--json"]),
+            osv(&["npm-utils", "pack", "--pack-destination", "/tmp/out"]),
             osv(&["npm-utils", "sbom", "/tmp/x", "--format", "cyclonedx"]),
             osv(&["npm-utils", "sbom", "--format", "spdx", "--name", "demo"]),
             osv(&["npm-utils", "audit", "/tmp/x"]),
