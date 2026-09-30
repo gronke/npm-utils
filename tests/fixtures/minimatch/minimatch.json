@@ -212,6 +212,20 @@
       true
     ],
     [
+      "!(a|b)",
+      "(a|b)",
+      "default",
+      false,
+      false
+    ],
+    [
+      "!(a|b)",
+      "a",
+      "default",
+      false,
+      true
+    ],
+    [
       "!(a|b)c",
       "ac",
       "default",
@@ -1017,6 +1031,13 @@
       false
     ],
     [
+      "?\\.js",
+      "a.js",
+      "default",
+      false,
+      false
+    ],
+    [
       "?a",
       ".a",
       "default",
@@ -1089,6 +1110,13 @@
     [
       "@(a|@(b|c))",
       "c",
+      "default",
+      false,
+      true
+    ],
+    [
+      "@(a|b",
+      "@(a|b",
       "default",
       false,
       true
@@ -1206,6 +1234,62 @@
       false
     ],
     [
+      "[[:nope:]]",
+      "n",
+      "default",
+      false,
+      false
+    ],
+    [
+      "[[:nope:]]",
+      "n]",
+      "default",
+      false,
+      true
+    ],
+    [
+      "[[:print:]]",
+      "\u0001",
+      "default",
+      false,
+      true
+    ],
+    [
+      "[[:print:]]",
+      " ",
+      "default",
+      false,
+      false
+    ],
+    [
+      "[[:print:]]",
+      "a",
+      "default",
+      false,
+      false
+    ],
+    [
+      "[[:punct:]]",
+      "!",
+      "default",
+      false,
+      true
+    ],
+    [
+      "[[:punct:]]",
+      "$",
+      "default",
+      false,
+      false
+    ],
+    [
+      "[[:punct:]]",
+      "~",
+      "default",
+      false,
+      false
+    ],
+    [
       "[[:upper:]]",
       "a",
       "nocase",
@@ -1239,6 +1323,13 @@
       "default",
       false,
       true
+    ],
+    [
+      "[a-[:alpha:]]",
+      "x",
+      "default",
+      false,
+      false
     ],
     [
       "[a-c]",
@@ -1383,6 +1474,27 @@
     [
       "a$b",
       "a$b",
+      "default",
+      false,
+      true
+    ],
+    [
+      "a*\\|b",
+      "a",
+      "default",
+      false,
+      true
+    ],
+    [
+      "a*\\|b",
+      "a|b",
+      "default",
+      false,
+      true
+    ],
+    [
+      "a*\\|b",
+      "xb",
       "default",
       false,
       true
@@ -1724,6 +1836,34 @@
       false
     ],
     [
+      "a\\\\*",
+      "a\\xyz",
+      "default",
+      false,
+      true
+    ],
+    [
+      "a\\\\*{b,c}",
+      "a*b",
+      "default",
+      false,
+      true
+    ],
+    [
+      "a\\\\*{b,c}",
+      "a\\xyzb",
+      "default",
+      false,
+      false
+    ],
+    [
+      "a\\|b",
+      "a|b",
+      "default",
+      false,
+      true
+    ],
+    [
       "a^b",
       "a^b",
       "default",
@@ -1829,6 +1969,13 @@
       true
     ],
     [
+      "x*\\|",
+      "anything",
+      "default",
+      false,
+      true
+    ],
+    [
       "x{,.y}",
       "x",
       "default",
@@ -1909,6 +2056,10 @@
   "expansions": {
     "\\{a,b\\}": [
       "{a,b}"
+    ],
+    "a\\\\*{b,c}": [
+      "a\\*b",
+      "a\\*c"
     ],
     "a{,}": [
       "a",
