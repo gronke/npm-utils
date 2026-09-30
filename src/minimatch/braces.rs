@@ -7,7 +7,7 @@
 //! bound beyond `i64` is over any budget and an error, where the JavaScript loops on a rounded
 //! float until its cap.
 
-use super::{BraceLimit, Error, Options, MAX_PATTERN_LENGTH};
+use super::{BraceLimit, Error, Options, Quirk, MAX_PATTERN_LENGTH};
 
 const ESC_SLASH: char = '\u{FDD0}';
 const ESC_OPEN: char = '\u{FDD1}';
@@ -103,7 +103,11 @@ fn expand(pattern: &str, options: &Options) -> Result<Vec<String>, BraceLimit> {
     };
     let mut budget = Budget { options, groups: 0 };
     let out = expand_(&escape_braces(&pattern), &mut budget, true)?;
-    Ok(out.iter().map(|s| unescape_braces(s)).collect())
+    let keep_escapes = !options.keeps(Quirk::BracesStripEscapes);
+    Ok(out
+        .iter()
+        .map(|s| unescape_braces(s, keep_escapes))
+        .collect())
 }
 
 /// `escapeBraces`: `\\`, `\{`, `\}`, `\,` and `\.` become sentinels, left to right.
@@ -132,18 +136,28 @@ fn escape_braces(s: &str) -> String {
     out
 }
 
-/// `unescapeBraces`: the sentinels become the characters they stood for, `\\` a single `\`.
-fn unescape_braces(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
+/// `unescapeBraces`: the sentinels become the characters they stood for, `\\` a single `\`;
+/// with `keep_escapes` they become the escape sequences again, so the glob parser sees them.
+fn unescape_braces(s: &str, keep_escapes: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let plain = match c {
             ESC_SLASH => '\\',
             ESC_OPEN => '{',
             ESC_CLOSE => '}',
             ESC_COMMA => ',',
             ESC_PERIOD => '.',
-            c => c,
-        })
-        .collect()
+            c => {
+                out.push(c);
+                continue;
+            }
+        };
+        if keep_escapes {
+            out.push('\\');
+        }
+        out.push(plain);
+    }
+    out
 }
 
 /// balanced-match's result for `{` and `}`.

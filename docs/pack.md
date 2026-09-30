@@ -57,6 +57,36 @@ The packer fails closed past generous budgets, each error naming the rule line:
 Many distinct just-under-budget rules cost linearly, not exponentially.
 Where the port answers differently from the JavaScript on purpose (characters instead of UTF-16 units, Unicode case folding under `nocase`, a POSIX class beside an escaped `-`), `tests/minimatch.rs` lists the cases.
 
+## Quirks
+
+The rules are read strictly by default: the matcher refuses by name what minimatch guesses at and honours escapes everywhere.
+`--npm-quirks` (`pack::Settings { quirks: true }`) reads them as npm does, quirks included, for a listing identical to npm's on any input; ordinary rules read the same either way, and the pinned npm listing checks both.
+The never-ship veto and the budgets hold in both modes.
+`npm_utils::minimatch::Quirk` names each quirk:
+
+- `negation-before-group`: npm reads a leading `!(` as negation, so `!(a|b)` negates a literal `(a|b)`, which no path matches.
+  Strict refuses it; `!@(a|b)` negates a group match, `@(!(a|b))` is the group.
+- `raw-extension-fast-path`: `*<ext>` and `?<ext>` compare the raw extension text, so `*\.js` matches `a\.js` and not `a.js`.
+  Strict applies the regex, so the escape holds and `*\.js` matches `a.js`.
+- `escaped-pipe-alternates`: with other magic in the pattern, `\|` reaches the regex as an alternation, so `a*\|b` matches `a` and `xb`.
+  Strict keeps it a literal `|`.
+- `braces-strip-escapes`: brace expansion strips `\\`, `\{`, `\}`, `\,` and `\.`, but only when a `{…}` pair exists, so `a\\*` and `a\\*{b,c}` read the backslashes differently.
+  Strict lets the escapes survive expansion.
+- `posix-print-is-control`: `[[:print:]]` is `\p{C}`, the control and unassigned characters.
+  Strict: everything but `\p{C}` and the line and paragraph separators.
+- `posix-punct-skips-symbols`: `[[:punct:]]` is `\p{P}`, so `$`, `+`, `<`, `=`, `>`, `^`, `` ` ``, `|` and `~` are no punctuation.
+  Strict: `\p{P}\p{S}`.
+- `unmatchable-class-poisons`: a class that can match nothing (`[z-a]`, `[a-[:alpha:]]`) silently makes its whole segment match nothing.
+  Strict refuses it.
+- `unclosed-class-is-literal`: an unclosed `[` is a literal `[`.
+  Strict refuses it.
+- `unclosed-group-is-literal`: an unclosed group (`x*(`) is literal text.
+  Strict refuses it.
+- `unknown-posix-class-is-literal`: `[[:nope:]]` is a class of `[`, `:`, `n`, `o`, `p`, `e` and `:`, then a literal `]`.
+  Strict refuses it.
+
+The quirks live in minimatch (`isaacs/minimatch`) and brace-expansion (`juliangruber/brace-expansion`); the listing rules the never-ship veto deviates from live in `npm/npm-packlist` and `npm/ignore-walk`.
+
 ## The tarball
 
 The manifest's `name` and `version` pass the path-safety allowlists first (no `..`, no separators, one scope separator at most), since they become the filename; the verb writes through the same containment guards as an extraction.

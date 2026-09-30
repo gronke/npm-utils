@@ -1,7 +1,8 @@
 //! Ignore rules and `files` globs as [`Minimatch`] patterns under the options npm-packlist and
 //! ignore-walk hand minimatch: an ignore rule with `matchBase`, `dot`, `flipNegate` and
 //! `nocase`, a `files` entry over the whole path, case kept, `dot` on, no negation or comment
-//! prefix. An error from the matcher names the rule and its kind.
+//! prefix; minimatch's quirks off in the strict mode, the packer's default, or kept as npm
+//! reads them. An error from the matcher names the rule and its kind.
 
 use crate::minimatch::{Minimatch, Options};
 use crate::Result;
@@ -18,15 +19,18 @@ pub(crate) struct Rule {
 
 impl Rule {
     /// Compile one rule line; `None` for a blank line or a `#` comment. A line past a brace
-    /// budget is an error naming it; treating it as a literal could ship files an exclusion
-    /// was written to hide.
-    pub(crate) fn parse(line: &str) -> Result<Option<Rule>> {
+    /// budget, or one the strict mode refuses, is an error naming it; treating it as a literal
+    /// could ship files an exclusion was written to hide.
+    pub(crate) fn parse(line: &str, quirks: bool) -> Result<Option<Rule>> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return Ok(None);
         }
-        let mm =
-            Minimatch::new(line, Options::ignore_walk()).map_err(|e| format!("ignore rule {e}"))?;
+        let options = Options {
+            quirks,
+            ..Options::ignore_walk()
+        };
+        let mm = Minimatch::new(line, options).map_err(|e| format!("ignore rule {e}"))?;
         Ok(Some(Rule {
             negate: mm.negate(),
             kind: "ignore rule",
@@ -36,9 +40,9 @@ impl Rule {
 
     /// Compile a `files` entry the way npm-packlist 11 hands it to glob: matched against the
     /// whole path from the package root, case-sensitively, `dot` on, no negation prefix (the
-    /// caller stripped it), a `#` pattern being a literal like any other. The budgets apply as
-    /// for a rule.
-    pub(crate) fn parse_glob(pattern: &str) -> Result<Option<Rule>> {
+    /// caller stripped it), a `#` pattern being a literal like any other. The budgets and the
+    /// mode apply as for a rule.
+    pub(crate) fn parse_glob(pattern: &str, quirks: bool) -> Result<Option<Rule>> {
         if pattern.is_empty() {
             return Ok(None);
         }
@@ -46,6 +50,7 @@ impl Rule {
             dot: true,
             nonegate: true,
             nocomment: true,
+            quirks,
             ..Options::DEFAULT
         };
         let mm = Minimatch::new(pattern, options).map_err(|e| format!("files entry {e}"))?;
@@ -85,19 +90,21 @@ mod tests {
     use super::Rule;
 
     fn rule(line: &str) -> Rule {
-        Rule::parse(line).expect("a valid line").expect("a rule")
+        Rule::parse(line, true)
+            .expect("a valid line")
+            .expect("a rule")
     }
 
     #[test]
     fn blank_and_comment_lines_are_no_rules() {
-        assert!(Rule::parse("").unwrap().is_none());
-        assert!(Rule::parse("   ").unwrap().is_none());
-        assert!(Rule::parse("# note").unwrap().is_none());
-        assert!(Rule::parse_glob("").unwrap().is_none());
+        assert!(Rule::parse("", true).unwrap().is_none());
+        assert!(Rule::parse("   ", true).unwrap().is_none());
+        assert!(Rule::parse("# note", true).unwrap().is_none());
+        assert!(Rule::parse_glob("", true).unwrap().is_none());
         // A `files` entry has no comment or negation prefix.
-        let hash = Rule::parse_glob("#x").unwrap().unwrap();
+        let hash = Rule::parse_glob("#x", true).unwrap().unwrap();
         assert!(hash.matches("#x", false).unwrap());
-        let bang = Rule::parse_glob("!x").unwrap().unwrap();
+        let bang = Rule::parse_glob("!x", true).unwrap().unwrap();
         assert!(!bang.negate);
         assert!(bang.matches("!x", false).unwrap());
     }
@@ -108,12 +115,12 @@ mod tests {
             .matches("a/b/NODE_MODULES", false)
             .unwrap());
         assert!(rule("!/readme{,.*[^~$]}").negate);
-        let glob = Rule::parse_glob("lib/*.js").unwrap().unwrap();
+        let glob = Rule::parse_glob("lib/*.js", true).unwrap().unwrap();
         assert!(glob.matches("lib/a.js", false).unwrap());
         assert!(!glob.matches("lib/A.JS", false).unwrap());
         assert!(!glob.matches("x/lib/a.js", false).unwrap());
         assert!(glob.matches("lib", true).unwrap());
-        let dotted = Rule::parse_glob("*").unwrap().unwrap();
+        let dotted = Rule::parse_glob("*", true).unwrap().unwrap();
         assert!(dotted.matches(".hidden", false).unwrap());
     }
 
@@ -128,17 +135,19 @@ mod tests {
 
     #[test]
     fn errors_name_the_rule_and_its_kind() {
-        let error = Rule::parse("dist/{1..100000000}.tgz")
+        let error = Rule::parse("dist/{1..100000000}.tgz", true)
             .unwrap_err()
             .to_string();
         assert!(
             error.starts_with("ignore rule \"dist/{1..100000000}.tgz\": brace expansion"),
             "{error}"
         );
-        let error =
-            Rule::parse_glob("{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}")
-                .unwrap_err()
-                .to_string();
+        let error = Rule::parse_glob(
+            "{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}{a,b,c}",
+            true,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.starts_with("files entry \"{a,b,c}"), "{error}");
         assert!(error.contains("brace expansion"), "{error}");
         let error = rule("*(!(a))y")
@@ -149,5 +158,28 @@ mod tests {
             error.starts_with("ignore rule \"*(!(a))y\": step limit"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_strict_mode_refuses_by_name() {
+        // npm: negation of the literal `(dist)`, a rule that matches nothing.
+        let npm = Rule::parse("!(dist)", true).unwrap().unwrap();
+        assert!(npm.negate);
+        assert!(!npm.matches("dist", false).unwrap());
+        let error = Rule::parse("!(dist)", false).unwrap_err().to_string();
+        assert!(
+            error.starts_with("ignore rule \"!(dist)\": a leading `!(`"),
+            "{error}"
+        );
+        let error = Rule::parse_glob("lib/[a", false).unwrap_err().to_string();
+        assert!(
+            error.starts_with("files entry \"lib/[a\": the class"),
+            "{error}"
+        );
+        // A plain rule reads the same in both modes.
+        for quirks in [true, false] {
+            let rule = Rule::parse("!/readme{,.*[^~$]}", quirks).unwrap().unwrap();
+            assert!(rule.matches("/README.md", false).unwrap());
+        }
     }
 }

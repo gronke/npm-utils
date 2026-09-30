@@ -1,9 +1,11 @@
 //! The pattern tree of one path segment: ast.js ported. Extglob groups nest as nodes of an
 //! arena; a node records the index it had in its parent when it was created and never updates
 //! it, as the JavaScript does, because `isStart` reads that stale value after an adoption
-//! (`@(a|@(*|b))` depends on it).
+//! (`@(a|@(*|b))` depends on it). The strict mode refuses an unclosed group and keeps an
+//! escaped `|` literal ([`Quirk`]).
 
 use super::class::{parse_class, regexp_escape};
+use super::quirks::{Quirk, Refusal};
 use super::{unescape, Error, Options};
 
 const START_NO_TRAVERSAL: &str = r"(?!(?:^|/)\.\.?(?:$|/))";
@@ -114,7 +116,7 @@ pub(super) struct Ast {
 
 impl Ast {
     /// `AST.fromGlob`.
-    pub(super) fn from_glob(pattern: &str, options: Options) -> Ast {
+    pub(super) fn from_glob(pattern: &str, options: Options) -> Result<Ast, Refusal> {
         let mut ast = Ast {
             nodes: Vec::new(),
             negs: Vec::new(),
@@ -123,8 +125,8 @@ impl Ast {
         };
         ast.new_node(None, None);
         let chars: Vec<char> = pattern.chars().collect();
-        ast.parse_ast(&chars, ROOT, 0, 0);
-        ast
+        ast.parse_ast(&chars, ROOT, 0, 0)?;
+        Ok(ast)
     }
 
     fn new_node(&mut self, kind: Option<char>, parent: Option<usize>) -> usize {
@@ -264,7 +266,13 @@ impl Ast {
     }
 
     /// `#parseAST`: the segment from `pos`, into `ast`; returns where it stopped.
-    fn parse_ast(&mut self, s: &[char], ast: usize, pos: usize, ext_depth: usize) -> usize {
+    fn parse_ast(
+        &mut self,
+        s: &[char],
+        ast: usize,
+        pos: usize,
+        ext_depth: usize,
+    ) -> Result<usize, Refusal> {
         const MAX_DEPTH: usize = 2;
         let noext = self.options.noext;
         let mut escaping = false;
@@ -306,14 +314,14 @@ impl Ast {
                 if do_recurse {
                     self.push_str(ast, std::mem::take(&mut acc));
                     let ext = self.new_node(Some(c), Some(ast));
-                    i = self.parse_ast(s, ext, i, ext_depth + 1);
+                    i = self.parse_ast(s, ext, i, ext_depth + 1)?;
                     self.push_node(ast, ext);
                     continue;
                 }
                 acc.push(c);
             }
             self.push_str(ast, acc);
-            return i;
+            return Ok(i);
         }
         // Some kind of extglob; pos is at the `(`. Find the next `|` or `)`.
         let kind = self.nodes[ast].kind;
@@ -356,7 +364,7 @@ impl Ast {
                 self.push_str(part, std::mem::take(&mut acc));
                 let ext = self.new_node(Some(c), Some(part));
                 self.push_node(part, ext);
-                i = self.parse_ast(s, ext, i, ext_depth + depth_add);
+                i = self.parse_ast(s, ext, i, ext_depth + depth_add)?;
                 continue;
             }
             if c == '|' {
@@ -374,15 +382,23 @@ impl Ast {
                     self.push_node(ast, p);
                 }
                 self.push_node(ast, part);
-                return i;
+                return Ok(i);
             }
             acc.push(c);
         }
         // An unfinished extglob: not an extglob, maybe something else in there.
+        let rest: String = s[pos - 1..].iter().collect();
+        if !self.options.keeps(Quirk::UnclosedGroupIsLiteral) {
+            let shown: String = rest.chars().take(40).collect();
+            return Err(Refusal::new(
+                Quirk::UnclosedGroupIsLiteral,
+                format!("the group `{shown}` never closes"),
+            ));
+        }
         self.nodes[ast].kind = None;
         self.nodes[ast].has_magic = None;
-        self.nodes[ast].parts = vec![Piece::Str(s[pos - 1..].iter().collect())];
-        i
+        self.nodes[ast].parts = vec![Piece::Str(rest)];
+        Ok(i)
     }
 
     fn can_adopt(&self, n: usize, child: usize, map: fn(char) -> &'static [char]) -> bool {
@@ -509,7 +525,9 @@ impl Ast {
     /// `toMMPattern`: the literal when nothing is magic, else the compiled regex.
     pub(super) fn into_mm_pattern(mut self, pattern: &str) -> Result<MmPattern, Error> {
         let glob = self.to_string(ROOT);
-        let src = self.regexp_source(ROOT, None);
+        let src = self
+            .regexp_source(ROOT, None)
+            .map_err(|refusal| refusal.into_error(pattern))?;
         // Under nocase a pattern with cased letters needs the engine even without magic.
         let any_magic = src.has_magic
             || self.nodes[ROOT].has_magic.unwrap_or(false)
@@ -536,7 +554,11 @@ impl Ast {
     }
 
     /// `toRegExpSource`.
-    pub(super) fn regexp_source(&mut self, n: usize, allow_dot: Option<bool>) -> Src {
+    pub(super) fn regexp_source(
+        &mut self,
+        n: usize,
+        allow_dot: Option<bool>,
+    ) -> Result<Src, Refusal> {
         let dot = allow_dot.unwrap_or(self.options.dot);
         if n == ROOT {
             self.flatten(ROOT);
@@ -549,24 +571,24 @@ impl Ast {
         // with, so `*(?)` can match `x.y`.
         let repeated = kind == '*' || kind == '+';
         let start = if kind == '!' { "(?:(?!(?:" } else { "(?:" };
-        let mut body = self.parts_to_regexp(n, dot);
+        let mut body = self.parts_to_regexp(n, dot)?;
         if self.is_start(n) && self.is_end(n) && body.is_empty() && kind != '!' {
             // An invalid extglob: something has to be present when it is the whole segment.
             let s = self.to_string(n);
             self.nodes[n].parts = vec![Piece::Str(s.clone())];
             self.nodes[n].kind = None;
             self.nodes[n].has_magic = None;
-            return Src {
+            return Ok(Src {
                 re: s.clone(),
                 body: unescape(&s, true),
                 has_magic: false,
                 uflag: false,
-            };
+            });
         }
         let mut body_dot_allowed = if !repeated || allow_dot == Some(true) || dot {
             String::new()
         } else {
-            self.parts_to_regexp(n, true)
+            self.parts_to_regexp(n, true)?
         };
         if body_dot_allowed == body {
             body_dot_allowed.clear();
@@ -603,23 +625,28 @@ impl Ast {
         };
         let has_magic = self.nodes[n].has_magic.unwrap_or(false);
         self.nodes[n].has_magic = Some(has_magic);
-        Src {
+        Ok(Src {
             re,
             body: unescape(&body, true),
             has_magic,
             uflag: self.nodes[n].uflag,
-        }
+        })
     }
 
-    fn plain_source(&mut self, n: usize, allow_dot: Option<bool>, dot: bool) -> Src {
+    fn plain_source(
+        &mut self,
+        n: usize,
+        allow_dot: Option<bool>,
+        dot: bool,
+    ) -> Result<Src, Refusal> {
         let parts = self.nodes[n].parts.clone();
         let no_empty =
             self.is_start(n) && self.is_end(n) && parts.iter().all(|p| matches!(p, Piece::Str(_)));
         let mut src = String::new();
         for p in parts {
             let piece = match p {
-                Piece::Str(s) => parse_glob(&s, no_empty),
-                Piece::Node(id) => self.regexp_source(id, allow_dot),
+                Piece::Str(s) => parse_glob(&s, no_empty, &self.options)?,
+                Piece::Node(id) => self.regexp_source(id, allow_dot)?,
             };
             let node = &mut self.nodes[n];
             node.has_magic = Some(node.has_magic.unwrap_or(false) || piece.has_magic);
@@ -661,17 +688,17 @@ impl Ast {
         };
         let has_magic = self.nodes[n].has_magic.unwrap_or(false);
         self.nodes[n].has_magic = Some(has_magic);
-        Src {
+        Ok(Src {
             re: format!("{start}{src}{end}"),
             body: unescape(&src, true),
             has_magic,
             uflag: self.nodes[n].uflag,
-        }
+        })
     }
 
     /// `#partsToRegExp`: the alternatives joined, empties dropped when the group is the whole
     /// segment.
-    fn parts_to_regexp(&mut self, n: usize, dot: bool) -> String {
+    fn parts_to_regexp(&mut self, n: usize, dot: bool) -> Result<String, Refusal> {
         let parts = self.nodes[n].parts.clone();
         let keep_empties = !(self.is_start(n) && self.is_end(n));
         let mut out = Vec::new();
@@ -679,18 +706,18 @@ impl Ast {
             let Piece::Node(id) = p else {
                 continue;
             };
-            let src = self.regexp_source(id, Some(dot));
+            let src = self.regexp_source(id, Some(dot))?;
             self.nodes[n].uflag |= src.uflag;
             if keep_empties || !src.re.is_empty() {
                 out.push(src.re);
             }
         }
-        out.join("|")
+        Ok(out.join("|"))
     }
 }
 
 /// `#parseGlob`: one plain string of a segment as a regex source.
-fn parse_glob(glob: &str, no_empty: bool) -> Src {
+fn parse_glob(glob: &str, no_empty: bool, options: &Options) -> Result<Src, Refusal> {
     let chars: Vec<char> = glob.chars().collect();
     let all_stars = !chars.is_empty() && chars.iter().all(|&c| c == '*');
     let mut escaping = false;
@@ -704,7 +731,8 @@ fn parse_glob(glob: &str, no_empty: bool) -> Src {
         let c = chars[i];
         if escaping {
             escaping = false;
-            if RE_SPECIALS.contains(c) {
+            let pipe = c == '|' && !options.keeps(Quirk::EscapedPipeAlternates);
+            if RE_SPECIALS.contains(c) || pipe {
                 re.push('\\');
             }
             re.push(c);
@@ -735,7 +763,7 @@ fn parse_glob(glob: &str, no_empty: bool) -> Src {
             continue;
         }
         if c == '[' {
-            let class = parse_class(&chars, i);
+            let class = parse_class(&chars, i, options)?;
             if class.consumed > 0 {
                 re.push_str(&class.src);
                 uflag |= class.uflag;
@@ -753,12 +781,12 @@ fn parse_glob(glob: &str, no_empty: bool) -> Src {
         regexp_escape(c, &mut re);
         i += 1;
     }
-    Src {
+    Ok(Src {
         re,
         body: unescape(glob, true),
         has_magic,
         uflag,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1005,6 +1033,7 @@ mod tests {
     fn sources_are_minimatchs() {
         for (pattern, preset, expect) in TABLE {
             let mm = Ast::from_glob(pattern, options(preset))
+                .unwrap_or_else(|r| panic!("{pattern:?} ({preset}): {}", r.reason))
                 .into_mm_pattern(pattern)
                 .unwrap_or_else(|e| panic!("{pattern:?} ({preset}): {e}"));
             match (expect, &mm) {
@@ -1027,6 +1056,7 @@ mod tests {
     #[test]
     fn the_glob_is_reconstructed_before_flattening() {
         let mm = Ast::from_glob("+(a|+(b|c)|d)", Options::DEFAULT)
+            .unwrap()
             .into_mm_pattern("+(a|+(b|c)|d)")
             .unwrap();
         match mm {

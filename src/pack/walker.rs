@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use super::collate;
 use super::pattern::Rule;
+use super::Settings;
 use crate::Result;
 
 /// The depth the walk descends to. The walk and the rule filter recurse per level, and a few
@@ -158,16 +159,16 @@ impl Level {
     }
 }
 
-fn rules<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Result<Vec<Rule>> {
+fn rules<S: AsRef<str>>(lines: impl IntoIterator<Item = S>, quirks: bool) -> Result<Vec<Rule>> {
     lines
         .into_iter()
-        .map(|line| Rule::parse(line.as_ref()))
+        .map(|line| Rule::parse(line.as_ref(), quirks))
         .filter_map(Result::transpose)
         .collect()
 }
 
 /// The rules of `dir/<name>` when that ignore file exists.
-fn ignore_file(dir: &Path, name: &str) -> Result<Option<Vec<Rule>>> {
+fn ignore_file(dir: &Path, name: &str, quirks: bool) -> Result<Option<Vec<Rule>>> {
     let path = dir.join(name);
     if !path.is_file() {
         return Ok(None);
@@ -175,26 +176,28 @@ fn ignore_file(dir: &Path, name: &str) -> Result<Option<Vec<Rule>>> {
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     Ok(Some(
-        rules(text.lines()).map_err(|e| format!("{}: {e}", path.display()))?,
+        rules(text.lines(), quirks).map_err(|e| format!("{}: {e}", path.display()))?,
     ))
 }
 
 /// The files of the package at `root` that ship, `/`-separated and relative to it, in
 /// npm-packlist's order (extension, then basename, then path).
-pub(crate) fn walk(root: &Path, manifest: &Value) -> Result<Vec<String>> {
-    let RootRules { allowlist, strict } = package_rules(root, manifest)?;
+pub(crate) fn walk(root: &Path, manifest: &Value, settings: &Settings) -> Result<Vec<String>> {
+    let quirks = settings.quirks;
+    let RootRules { allowlist, strict } = package_rules(root, manifest, quirks)?;
     // The stock sets compile once; every level below the root shares them.
     let shared = Shared {
-        defaults: Rc::new(rules(DEFAULTS)?),
-        strict: Rc::new(rules(STRICT_DEFAULTS)?),
+        defaults: Rc::new(rules(DEFAULTS, quirks)?),
+        strict: Rc::new(rules(STRICT_DEFAULTS, quirks)?),
+        quirks,
     };
     let mut level = Level {
         basename: String::new(),
         exact: false,
         defaults: Rc::clone(&shared.defaults),
         allowlist,
-        npmignore: ignore_file(root, ".npmignore")?,
-        gitignore: ignore_file(root, ".gitignore")?,
+        npmignore: ignore_file(root, ".npmignore", quirks)?,
+        gitignore: ignore_file(root, ".gitignore", quirks)?,
         strict: Rc::new(strict),
     };
     if level.allowlist.is_none() && level.npmignore.is_none() && level.gitignore.is_some() {
@@ -221,7 +224,7 @@ struct RootRules {
     strict: Vec<Rule>,
 }
 
-fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
+fn package_rules(root: &Path, manifest: &Value, quirks: bool) -> Result<RootRules> {
     let mut strict: Vec<String> = STRICT_DEFAULTS
         .iter()
         .chain(ROOT_STRICT)
@@ -240,7 +243,7 @@ fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
             } else {
                 entry
             });
-            let Some(glob) = Rule::parse_glob(pattern)? else {
+            let Some(glob) = Rule::parse_glob(pattern, quirks)? else {
                 continue;
             };
             let prefix = if negation { "" } else { "!" };
@@ -255,7 +258,7 @@ fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
     let allowlist = if files.is_some() {
         let mut lines = vec!["*".to_string()];
         lines.extend(ignores.iter().cloned());
-        Some(rules(&lines)?)
+        Some(rules(&lines, quirks)?)
     } else {
         None
     };
@@ -302,7 +305,7 @@ fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
     }
     Ok(RootRules {
         allowlist,
-        strict: rules(&strict)?,
+        strict: rules(&strict, quirks)?,
     })
 }
 
@@ -446,10 +449,12 @@ fn normalize_bin(path: &str) -> String {
     segments.join("/")
 }
 
-/// The rule sets every level below the root uses as they are.
+/// The rule sets every level below the root uses as they are, and the mode its ignore files
+/// are read in.
 struct Shared {
     defaults: Rc<Vec<Rule>>,
     strict: Rc<Vec<Rule>>,
+    quirks: bool,
 }
 
 fn walk_dir(
@@ -505,8 +510,8 @@ fn walk_dir(
                 exact,
                 defaults: Rc::clone(&shared.defaults),
                 allowlist: None,
-                npmignore: ignore_file(&path, ".npmignore")?,
-                gitignore: ignore_file(&path, ".gitignore")?,
+                npmignore: ignore_file(&path, ".npmignore", shared.quirks)?,
+                gitignore: ignore_file(&path, ".gitignore", shared.quirks)?,
                 strict: Rc::clone(&shared.strict),
             };
             child.silence();
@@ -616,7 +621,12 @@ mod tests {
 
     fn listed(dir: &Path, manifest: &str) -> Vec<String> {
         fs::write(dir.join("package.json"), manifest).unwrap();
-        walk(dir, &serde_json::from_str(manifest).unwrap()).unwrap()
+        walk(
+            dir,
+            &serde_json::from_str(manifest).unwrap(),
+            &crate::pack::Settings::default(),
+        )
+        .unwrap()
     }
 
     #[test]

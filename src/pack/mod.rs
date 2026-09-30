@@ -75,10 +75,26 @@ impl Deref for Tarball {
     }
 }
 
+/// The settings of a pack; the default reads the rules strictly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Settings {
+    /// minimatch's quirks kept in the rules, as npm reads them (`pack --npm-quirks`), for a
+    /// listing identical to npm's on any input. Off, the default, is the strict mode: ambiguous
+    /// and unclosed rule syntax fails the pack naming the rule, escapes hold everywhere, the
+    /// POSIX class translations are corrected; [`crate::minimatch::Quirk`] lists the quirks.
+    /// The never-ship veto and the budgets hold in both modes.
+    pub quirks: bool,
+}
+
 /// The files of the package at `dir` that npm would publish, `/`-separated and relative to `dir`,
 /// in npm-packlist's order (extension, then basename, then path).
 pub fn list(dir: &Path) -> Result<Vec<String>> {
-    walker::walk(dir, &manifest(dir)?)
+    list_with(dir, &Settings::default())
+}
+
+/// [`list`] under `settings`.
+pub fn list_with(dir: &Path, settings: &Settings) -> Result<Vec<String>> {
+    walker::walk(dir, &manifest(dir)?, settings)
 }
 
 /// The tarball's filename for the package at `dir`, `<name>-<version>.tgz`, once the manifest's
@@ -106,12 +122,17 @@ pub struct Plan {
 impl Plan {
     /// Read the manifest at `dir`, validate its name and version, and freeze the listing.
     pub fn new(dir: &Path) -> Result<Plan> {
+        Plan::with(dir, &Settings::default())
+    }
+
+    /// [`Plan::new`] under `settings`.
+    pub fn with(dir: &Path, settings: &Settings) -> Result<Plan> {
         let manifest = manifest(dir)?;
         Ok(Plan {
             dir: dir.to_path_buf(),
             name: field(&manifest, "name").to_string(),
             version: field(&manifest, "version").to_string(),
-            files: walker::walk(dir, &manifest)?,
+            files: walker::walk(dir, &manifest, settings)?,
             bins: walker::bin_targets(dir, &manifest),
         })
     }

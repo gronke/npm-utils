@@ -438,6 +438,45 @@ fn pack_refuses_a_hostile_ignore_file() {
 }
 
 #[test]
+fn pack_refuses_by_name_unless_npm_quirks_is_given() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(project.path().join("index.js"), "x").unwrap();
+    std::fs::write(project.path().join(".npmignore"), "!(dist)\n").unwrap();
+    let out = npm_utils()
+        .args(["pack", "--dry-run", "--json", "--npm-quirks"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = npm_utils()
+        .args(["pack", "--dry-run", "--json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("!(dist)"), "{stderr}");
+    assert!(stderr.contains("negation"), "{stderr}");
+    assert!(
+        std::fs::read_dir(project.path()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tgz")),
+        "no tarball is written"
+    );
+}
+
+#[test]
 fn a_secret_named_by_main_never_reaches_the_written_tarball() {
     // npm ships `.npmrc` when `main` names it (npm 9.2, npm-packlist 11.3.0); this crate never
     // does. Check the written tarball, not just the listing.

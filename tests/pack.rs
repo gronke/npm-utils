@@ -340,6 +340,47 @@ fn patterns_without_lookaround_run_in_linear_time() {
 }
 
 #[test]
+fn the_default_refuses_what_npm_guesses_at() {
+    let manifest = r#"{"name":"demo","version":"1.0.0"}"#;
+    let npm = pack::Settings { quirks: true };
+    // npm reads `!(dist)` as the negation of a literal `(dist)`: a rule that matches nothing.
+    let dir = package(
+        &[
+            ("index.js", ""),
+            ("dist/x.js", ""),
+            (".npmignore", "!(dist)\n"),
+        ],
+        manifest,
+    );
+    let listed = pack::list_with(dir.path(), &npm).unwrap();
+    assert!(listed.iter().any(|f| f == "dist/x.js"), "{listed:?}");
+    let error = pack::list(dir.path()).unwrap_err().to_string();
+    // The ignore file's path leads, then the rule and the reason.
+    assert!(
+        error.ends_with(
+            ".npmignore: ignore rule \"!(dist)\": a leading `!(` is negation in npm and a group \
+             in Bash; write `!@(…)` to negate a group match or `@(!(…))` for the group"
+        ),
+        "{error}"
+    );
+    // `*\.js` compares the raw extension in npm; the strict default honours the escape.
+    let dir = package(
+        &[("a.js", ""), ("b.txt", ""), (".npmignore", "*\\.js\n")],
+        manifest,
+    );
+    let listed = pack::list_with(dir.path(), &npm).unwrap();
+    assert!(listed.iter().any(|f| f == "a.js"), "{listed:?}");
+    let listed = pack::list(dir.path()).unwrap();
+    assert!(listed.iter().all(|f| f != "a.js"), "{listed:?}");
+    assert!(listed.iter().any(|f| f == "b.txt"), "{listed:?}");
+    // The plan carries the setting the same way.
+    let plan = pack::Plan::with(dir.path(), &npm).unwrap();
+    assert!(plan.files().iter().any(|f| f == "a.js"));
+    let plan = pack::Plan::new(dir.path()).unwrap();
+    assert!(plan.files().iter().all(|f| f != "a.js"));
+}
+
+#[test]
 fn a_just_under_budget_pattern_still_matches_correctly() {
     // The budget must not be so tight that a nasty-but-legal rule misbehaves: `*x*x*x*y` does
     // not match 40 `x`s (the file ships), `*x*x*x*` does (it is excluded).

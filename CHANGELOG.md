@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - pack: `.npmrc`, VCS metadata, `node_modules` and root lockfiles never ship, whatever the manifest says; hostile ignore rules and deep trees fail with an error naming the input.
 - pack: lifecycle scripts, workspaces, package specs and bundled dependencies are out of scope.
 - minimatch: npm's glob matcher (minimatch 10.2.5) as `npm_utils::minimatch` on fancy-regex, pinned by a fixture recorded from the JavaScript; brace, backtracking and globstar budgets error instead of truncating or hanging. `pack` matches its rules with it.
+- pack: the rules are read strictly by default: minimatch's ten quirks, named in `npm_utils::minimatch::Quirk`, are off, so ambiguous and unclosed rule syntax fails the pack naming the rule, escapes hold everywhere, `[[:print:]]` and `[[:punct:]]` are corrected; `--npm-quirks` (`pack::Settings { quirks: true }`) reads them as npm does.
 
 ## [0.6.2] - 2026-07-22
 

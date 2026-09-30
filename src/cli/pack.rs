@@ -9,9 +9,16 @@ use crate::pack;
 /// streams into a sink and nothing is written, else into a temporary sibling that replaces the
 /// destination once the pack succeeded. With `json` the report is npm 12's `pack --json` object
 /// on stdout, keyed by the package name, else the contents go to stderr as npm's notice block
-/// and the tarball's filename to stdout.
-pub(super) fn run(dir: &Path, dry_run: bool, json: bool, destination: Option<&Path>) -> Res {
-    let plan = pack::Plan::new(dir)?;
+/// and the tarball's filename to stdout. With `quirks` the rules are read as npm reads them;
+/// the default is the strict mode.
+pub(super) fn run(
+    dir: &Path,
+    dry_run: bool,
+    json: bool,
+    destination: Option<&Path>,
+    quirks: bool,
+) -> Res {
+    let plan = pack::Plan::with(dir, &pack::Settings { quirks })?;
     let tarball = if dry_run {
         plan.write(std::io::sink())?
     } else {

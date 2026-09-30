@@ -36,7 +36,7 @@
 //! - [`pack`]: the files a package directory publishes and their tarball, by npm-packlist's
 //!   rules, `npm pack` in pure Rust.
 //! - [`minimatch`]: npm's glob matcher (minimatch 10.2.5) on `fancy-regex`, with brace and
-//!   backtracking budgets; `pack` matches its rules with it.
+//!   backtracking budgets and its quirks named and switchable; `pack` matches its rules with it.
 //! - [`audit`] — check those same pinned packages against vulnerability advisories from multiple
 //!   sources (npm's registry endpoint, OSV) behind a small source trait — `npm audit`, pure Rust.
 //!

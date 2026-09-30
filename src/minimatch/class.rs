@@ -2,7 +2,12 @@
 //! properties as minimatch does, quirks included (`[:print:]` is `\p{C}`, `[:graph:]` its
 //! negation, `[:ascii:]` and `[:xdigit:]` plain ranges). The regex crate reads `&&`, `~~` and
 //! `--` inside a class as set operations, so the port escapes `&` and `~` there where the
-//! JavaScript does not; that is the one difference in the sources.
+//! JavaScript does not; that is the one difference in the sources. The strict mode corrects
+//! `[:print:]` and `[:punct:]` and refuses what can match nothing, never closes or names no
+//! POSIX class ([`Quirk`]).
+
+use super::quirks::{Quirk, Refusal};
+use super::Options;
 
 /// One parsed class.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,14 +102,31 @@ fn is_single(range: &str) -> bool {
     }
 }
 
+/// The text from `pos` on, shortened, for an error message.
+fn excerpt(glob: &[char], pos: usize) -> String {
+    let mut text: String = glob[pos..].iter().take(40).collect();
+    if glob.len() - pos > 40 {
+        text.push('…');
+    }
+    text
+}
+
 /// `parseClass`: the class at `glob[pos]` (a `[`) as a regex source.
-pub(super) fn parse_class(glob: &[char], pos: usize) -> Class {
+pub(super) fn parse_class(glob: &[char], pos: usize, options: &Options) -> Result<Class, Refusal> {
     debug_assert_eq!(glob.get(pos), Some(&'['), "not in a brace expression");
-    let poison = |consumed: usize| Class {
-        src: "$.".to_string(),
-        uflag: false,
-        consumed,
-        magic: true,
+    let poison = || -> Result<Class, Refusal> {
+        if !options.keeps(Quirk::UnmatchableClassPoisons) {
+            return Err(Refusal::new(
+                Quirk::UnmatchableClassPoisons,
+                format!("the class `{}` can match nothing", excerpt(glob, pos)),
+            ));
+        }
+        Ok(Class {
+            src: "$.".to_string(),
+            uflag: false,
+            consumed: glob.len() - pos,
+            magic: true,
+        })
     };
     let mut ranges: Vec<String> = Vec::new();
     let mut negs: Vec<String> = Vec::new();
@@ -139,8 +161,17 @@ pub(super) fn parse_class(glob: &[char], pos: usize) -> Class {
                 if starts_with(glob, i, name) {
                     // `[a-[]` is fine, `[a-[:alpha:]]` is not.
                     if range_start.is_some() {
-                        return poison(glob.len() - pos);
+                        return poison();
                     }
+                    let (translation, negated) = match name {
+                        "[:print:]" if !options.keeps(Quirk::PosixPrintIsControl) => {
+                            (r"\p{Zl}\p{Zp}\p{C}", true)
+                        }
+                        "[:punct:]" if !options.keeps(Quirk::PosixPunctSkipsSymbols) => {
+                            (r"\p{P}\p{S}", false)
+                        }
+                        _ => (translation, negated),
+                    };
                     i += name.len();
                     if negated {
                         negs.push(translation.to_string());
@@ -149,6 +180,19 @@ pub(super) fn parse_class(glob: &[char], pos: usize) -> Class {
                     }
                     uflag = uflag || needs_u;
                     continue 'class;
+                }
+            }
+            if !options.keeps(Quirk::UnknownPosixClassIsLiteral) && glob.get(i + 1) == Some(&':') {
+                let mut j = i + 2;
+                while glob.get(j).is_some_and(char::is_ascii_alphabetic) {
+                    j += 1;
+                }
+                if j > i + 2 && glob.get(j) == Some(&':') && glob.get(j + 1) == Some(&']') {
+                    let name: String = glob[i + 2..j].iter().collect();
+                    return Err(Refusal::new(
+                        Quirk::UnknownPosixClassIsLiteral,
+                        format!("`[:{name}:]` is no POSIX class"),
+                    ));
                 }
             }
         }
@@ -181,28 +225,34 @@ pub(super) fn parse_class(glob: &[char], pos: usize) -> Class {
     }
     if end_pos < i {
         // No end of the class: not a class, maybe a literal `[`.
-        return Class {
+        if !options.keeps(Quirk::UnclosedClassIsLiteral) {
+            return Err(Refusal::new(
+                Quirk::UnclosedClassIsLiteral,
+                format!("the class `{}` never closes", excerpt(glob, pos)),
+            ));
+        }
+        return Ok(Class {
             src: String::new(),
             uflag: false,
             consumed: 0,
             magic: false,
-        };
+        });
     }
     // No ranges and no negations cannot match anything, and that poisons the whole glob.
     if ranges.is_empty() && negs.is_empty() {
-        return poison(glob.len() - pos);
+        return poison();
     }
     // One positive single character is that literal, not magic: `[_]` escapes glob magic.
     if negs.is_empty() && ranges.len() == 1 && !negate && is_single(&ranges[0]) {
         let literal = ranges[0].chars().last().unwrap_or_default();
         let mut src = String::new();
         regexp_escape(literal, &mut src);
-        return Class {
+        return Ok(Class {
             src,
             uflag: false,
             consumed: end_pos - pos,
             magic: false,
-        };
+        });
     }
     let sranges = format!("[{}{}]", if negate { "^" } else { "" }, ranges.concat());
     let snegs = format!("[{}{}]", if negate { "" } else { "^" }, negs.concat());
@@ -213,21 +263,22 @@ pub(super) fn parse_class(glob: &[char], pos: usize) -> Class {
     } else {
         snegs
     };
-    Class {
+    Ok(Class {
         src,
         uflag,
         consumed: end_pos - pos,
         magic: true,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::Options;
     use super::{parse_class, Class};
 
     fn parse(glob: &str) -> Class {
         let chars: Vec<char> = glob.chars().collect();
-        parse_class(&chars, 0)
+        parse_class(&chars, 0, &Options::DEFAULT).unwrap_or_else(|r| panic!("{}", r.reason))
     }
 
     /// The class translations of minimatch 10.2.5, recorded with node, as `(class, regex source,

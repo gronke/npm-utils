@@ -25,6 +25,9 @@ mod ast;
 mod braces;
 mod class;
 mod matcher;
+mod quirks;
+
+pub use quirks::Quirk;
 
 /// minimatch's `braceExpand`: the strings a pattern's braces expand to, in Bash's order, with
 /// duplicates; the pattern itself when it holds no brace pair or under `nobrace`.
@@ -136,6 +139,10 @@ pub struct Options {
     pub backtrack_limit: usize,
     /// The most `**` sections one pattern may hold; minimatch's `maxGlobstarRecursion`.
     pub max_globstar_recursion: usize,
+    /// minimatch's quirks kept, the default here, so a pattern means what it means to npm. Off
+    /// is the strict mode: ambiguous and unclosed syntax is refused by name, escapes hold
+    /// everywhere, the POSIX class translations are corrected. [`Quirk`] lists the ten.
+    pub quirks: bool,
 }
 
 impl Options {
@@ -155,7 +162,13 @@ impl Options {
         max_brace_length: 4_000_000,
         backtrack_limit: 1_000_000,
         max_globstar_recursion: 200,
+        quirks: true,
     };
+
+    /// Whether a quirk is in force; every quirk follows [`Options::quirks`].
+    pub const fn keeps(&self, _quirk: Quirk) -> bool {
+        self.quirks
+    }
 
     /// The options ignore-walk hands minimatch for an ignore-file rule: `matchBase`, `dot`,
     /// `flipNegate` and `nocase`.
@@ -200,6 +213,12 @@ pub enum Error {
     Regex { pattern: String, source: String },
     /// More `**` sections than [`Options::max_globstar_recursion`].
     GlobstarRecursion { pattern: String, limit: usize },
+    /// Syntax the strict mode refuses where minimatch guesses; the quirk names the behaviour.
+    Refused {
+        pattern: String,
+        quirk: Quirk,
+        reason: String,
+    },
     /// Longer than [`MAX_PATTERN_LENGTH`].
     PatternTooLong { len: usize },
 }
@@ -227,6 +246,9 @@ impl std::fmt::Display for Error {
             Error::GlobstarRecursion { pattern, limit } => {
                 write!(f, "{pattern:?}: more than {limit} globstar sections")
             }
+            Error::Refused {
+                pattern, reason, ..
+            } => write!(f, "{pattern:?}: {reason}"),
             Error::PatternTooLong { len } => {
                 write!(
                     f,
@@ -285,7 +307,17 @@ impl Minimatch {
             return Ok(());
         }
         // Step 1: negation. Step 2: braces, deduplicated in order.
-        let glob = self.parse_negate();
+        let (glob, stripped) = self.parse_negate();
+        if stripped > 0 && glob.starts_with('(') && !self.options.keeps(Quirk::NegationBeforeGroup)
+        {
+            return Err(Error::Refused {
+                pattern: self.pattern.clone(),
+                quirk: Quirk::NegationBeforeGroup,
+                reason: "a leading `!(` is negation in npm and a group in Bash; write `!@(…)` to \
+                         negate a group match or `@(!(…))` for the group"
+                    .to_string(),
+            });
+        }
         let mut seen = std::collections::HashSet::new();
         self.glob_set = braces::brace_expand(&glob, &self.options)?
             .into_iter()
@@ -306,10 +338,10 @@ impl Minimatch {
         Ok(())
     }
 
-    /// `parseNegate`: leading `!`s toggle negation and leave the pattern.
-    fn parse_negate(&mut self) -> String {
+    /// `parseNegate`: leading `!`s toggle negation and leave the pattern; also how many left.
+    fn parse_negate(&mut self) -> (String, usize) {
         if self.options.nonegate {
-            return self.pattern.clone();
+            return (self.pattern.clone(), 0);
         }
         let mut negate = false;
         let mut offset = 0;
@@ -321,7 +353,7 @@ impl Minimatch {
             offset += 1;
         }
         self.negate = negate;
-        self.pattern.chars().skip(offset).collect()
+        (self.pattern.chars().skip(offset).collect(), offset)
     }
 
     /// `preprocess` at optimization level 1: `**` becomes `*` under `noglobstar`, adjacent
@@ -364,8 +396,14 @@ impl Minimatch {
         if segment.is_empty() {
             return Ok(matcher::Part::Literal(String::new()));
         }
-        let fast = matcher::FastTest::of(segment, &self.options);
-        let mm = ast::Ast::from_glob(segment, self.options).into_mm_pattern(&self.pattern)?;
+        let fast = if self.options.keeps(Quirk::RawExtensionFastPath) {
+            matcher::FastTest::of(segment, &self.options)
+        } else {
+            None
+        };
+        let mm = ast::Ast::from_glob(segment, self.options)
+            .map_err(|refusal| refusal.into_error(&self.pattern))?
+            .into_mm_pattern(&self.pattern)?;
         Ok(matcher::Part::from_pattern(mm, fast))
     }
 
