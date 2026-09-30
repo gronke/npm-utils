@@ -407,8 +407,8 @@ fn pack_refuses_a_version_that_could_escape_the_destination() {
 fn pack_refuses_a_hostile_ignore_file() {
     // A brace bomb and a backtracking bomb in `.npmignore` both fail the pack fast, naming the
     // offending rule, and no tarball is written.
-    let long = "b".repeat(200);
-    for line in ["{1..100000000}", "*b*b*b*b*b*b*b*c"] {
+    let long = "a".repeat(200);
+    for line in ["{1..100000000}", "*(!(a))y"] {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
             project.path().join("package.json"),
@@ -420,6 +420,7 @@ fn pack_refuses_a_hostile_ignore_file() {
         std::fs::write(project.path().join(".npmignore"), format!("{line}\n")).unwrap();
         let out = npm_utils()
             .args(["pack", project.path().to_str().unwrap()])
+            .current_dir(project.path())
             .output()
             .unwrap();
         assert!(!out.status.success(), "{line}");

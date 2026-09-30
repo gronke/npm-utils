@@ -13,11 +13,12 @@
 //! deviates on purpose, see docs/pack.md.
 
 use std::path::Path;
+use std::rc::Rc;
 
 use serde_json::Value;
 
 use super::collate;
-use super::pattern::{fold, Rule};
+use super::pattern::Rule;
 use crate::Result;
 
 /// The depth the walk descends to. The walk and the rule filter recurse per level, and a few
@@ -92,6 +93,12 @@ const VETO_ROOT_FILES: &[&str] = &[
     "bun.lock",
 ];
 
+/// One lowercase form per character for the never-ship veto, so a vetoed spelling cannot slip
+/// past in a different case.
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 fn folded_eq(a: &str, b: &str) -> bool {
     a.chars().map(fold).eq(b.chars().map(fold))
 }
@@ -117,23 +124,23 @@ struct Level {
     /// ignore-walk's `exact`: the directory passed as a file or as `dir/`, so an ancestor's
     /// exclusion does not settle its entries before this level's own rules run.
     exact: bool,
-    defaults: Vec<Rule>,
+    defaults: Rc<Vec<Rule>>,
     /// The `files` allowlist, root only.
     allowlist: Option<Vec<Rule>>,
     npmignore: Option<Vec<Rule>>,
     gitignore: Option<Vec<Rule>>,
-    strict: Vec<Rule>,
+    strict: Rc<Vec<Rule>>,
 }
 
 impl Level {
     /// The rule sets in consultation order, absent ones skipped.
     fn sets(&self) -> impl Iterator<Item = &Vec<Rule>> {
         [
-            Some(&self.defaults),
+            Some(&*self.defaults),
             self.allowlist.as_ref(),
             self.npmignore.as_ref(),
             self.gitignore.as_ref(),
-            Some(&self.strict),
+            Some(&*self.strict),
         ]
         .into_iter()
         .flatten()
@@ -176,14 +183,19 @@ fn ignore_file(dir: &Path, name: &str) -> Result<Option<Vec<Rule>>> {
 /// npm-packlist's order (extension, then basename, then path).
 pub(crate) fn walk(root: &Path, manifest: &Value) -> Result<Vec<String>> {
     let RootRules { allowlist, strict } = package_rules(root, manifest)?;
+    // The stock sets compile once; every level below the root shares them.
+    let shared = Shared {
+        defaults: Rc::new(rules(DEFAULTS)?),
+        strict: Rc::new(rules(STRICT_DEFAULTS)?),
+    };
     let mut level = Level {
         basename: String::new(),
         exact: false,
-        defaults: rules(DEFAULTS)?,
+        defaults: Rc::clone(&shared.defaults),
         allowlist,
         npmignore: ignore_file(root, ".npmignore")?,
         gitignore: ignore_file(root, ".gitignore")?,
-        strict,
+        strict: Rc::new(strict),
     };
     if level.allowlist.is_none() && level.npmignore.is_none() && level.gitignore.is_some() {
         crate::warn::warn(
@@ -194,7 +206,7 @@ pub(crate) fn walk(root: &Path, manifest: &Value) -> Result<Vec<String>> {
     level.silence();
     let mut levels = vec![level];
     let mut out = Vec::new();
-    walk_dir(root, "", &mut levels, &mut out)?;
+    walk_dir(root, "", &mut levels, &shared, &mut out)?;
     // Backstop at the single choke point every inclusion mechanism flows through: nothing
     // vetoed leaves `walk`, whatever the rules decided.
     out.retain(|path| !never_ship(path));
@@ -434,7 +446,19 @@ fn normalize_bin(path: &str) -> String {
     segments.join("/")
 }
 
-fn walk_dir(dir: &Path, rel: &str, levels: &mut Vec<Level>, out: &mut Vec<String>) -> Result<()> {
+/// The rule sets every level below the root uses as they are.
+struct Shared {
+    defaults: Rc<Vec<Rule>>,
+    strict: Rc<Vec<Rule>>,
+}
+
+fn walk_dir(
+    dir: &Path,
+    rel: &str,
+    levels: &mut Vec<Level>,
+    shared: &Shared,
+    out: &mut Vec<String>,
+) -> Result<()> {
     if levels.len() > MAX_DEPTH {
         return Err(format!("{}: deeper than the {MAX_DEPTH}-level limit", dir.display()).into());
     }
@@ -479,15 +503,15 @@ fn walk_dir(dir: &Path, rel: &str, levels: &mut Vec<Level>, out: &mut Vec<String
             let mut child = Level {
                 basename: name.clone(),
                 exact,
-                defaults: rules(DEFAULTS)?,
+                defaults: Rc::clone(&shared.defaults),
                 allowlist: None,
                 npmignore: ignore_file(&path, ".npmignore")?,
                 gitignore: ignore_file(&path, ".gitignore")?,
-                strict: rules(STRICT_DEFAULTS)?,
+                strict: Rc::clone(&shared.strict),
             };
             child.silence();
             levels.push(child);
-            walk_dir(&path, &child_rel, levels, out)?;
+            walk_dir(&path, &child_rel, levels, shared, out)?;
             levels.pop();
         } else if meta.is_file() && pass_file {
             out.push(child_rel);

@@ -29,6 +29,7 @@ The walk ports npm-packlist over ignore-walk, rule set by rule set:
    Below the root only `/.git` stays out.
 
 Rules are minimatch patterns under npm's options: a slash-less pattern matches a basename at any depth, a leading `/` anchors it, `**` spans directories, bracket classes with ranges and POSIX names apply, so do the extglob groups `@()`, `?()`, `*()`, `+()` and `!()`, braces `{a,b}` and `{1..3}` expand, case is folded, a leading `!` makes an inclusion.
+The matcher is the crate's `minimatch` module, minimatch 10.2.5 ported onto fancy-regex and pinned by its own recorded fixture (`tests/minimatch.rs`).
 A child level first asks its parent about `dir/entry`, then applies its own rules; the last match decides.
 Only regular files ship; symlinks, special files and names carrying `*` are skipped.
 The order is npm-packlist's: extension, then basename, then path.
@@ -49,10 +50,12 @@ A package that means to publish these is broken or hostile.
 The packer fails closed past generous budgets, each error naming the rule line:
 
 - 10 000 brace alternatives and 100 brace groups per line; `{1..1000000000}` or sixteen `{a,b,c}` groups are an immediate error, where minimatch silently truncates past its own cap.
-- 1 000 000 backtracking steps per rule evaluation; `*b*b*b*b*b*b*b*c` or `+(b|bb)+(b|bb)+…` against a long name hangs minimatch 10.2.6 and `npm pack` 9.2.0 and 12.1.0, here it errors in milliseconds.
+- 1 000 000 backtracking steps per path segment on the regex engine; a negated group under a repeat (`*(!(a))y`, `+(!(a)|b)c`) against a long name hangs minimatch 10.2.5, here it errors in milliseconds.
+  A rule without lookaround (`*b*b*b*b*b*b*b*c`, `+(b|bb)+(b|bb)+…`) runs on regex-automata in linear time and never reaches the budget.
 - 64 directory levels; the walk and the filter recurse per level.
 
 Many distinct just-under-budget rules cost linearly, not exponentially.
+Where the port answers differently from the JavaScript on purpose (characters instead of UTF-16 units, Unicode case folding under `nocase`, a POSIX class beside an escaped `-`), `tests/minimatch.rs` lists the cases.
 
 ## The tarball
 

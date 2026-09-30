@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - pack: a pure-Rust local package packer as `npm_utils::pack` and the `pack` verb: npm-packlist 11.3.0 file selection pinned by a recorded npm 12.1.0 fixture, pacote's tarball layout streamed through a hashing writer, npm 12's `--json` shape.
 - pack: `.npmrc`, VCS metadata, `node_modules` and root lockfiles never ship, whatever the manifest says; hostile ignore rules and deep trees fail with an error naming the input.
 - pack: lifecycle scripts, workspaces, package specs and bundled dependencies are out of scope.
+- minimatch: npm's glob matcher (minimatch 10.2.5) as `npm_utils::minimatch` on fancy-regex, pinned by a fixture recorded from the JavaScript; brace, backtracking and globstar budgets error instead of truncating or hanging. `pack` matches its rules with it.
 
 ## [0.6.2] - 2026-07-22
 

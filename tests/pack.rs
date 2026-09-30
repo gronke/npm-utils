@@ -298,10 +298,10 @@ fn multiplicative_braces_fail_fast() {
 
 #[test]
 fn a_pathological_ignore_pattern_errors_instead_of_hanging() {
-    // A 200-char name and patterns that need ~1e13 backtracking steps against it: the pack
-    // fails naming the rule, in milliseconds, instead of hanging.
-    let long = "b".repeat(200);
-    for line in ["*b*b*b*b*b*b*b*c", "+(b|bb)+(b|bb)+(b|bb)+(b|bb)c"] {
+    // A 200-char name and a negated group under a repeat, which keeps the backtracking engine
+    // busy: the pack fails naming the rule, in milliseconds, instead of hanging.
+    let long = "a".repeat(200);
+    for line in ["*(!(a))y", "+(!(a)|b)c"] {
         let dir = package(
             &[
                 ("index.js", "console.log(1)\n"),
@@ -315,6 +315,28 @@ fn a_pathological_ignore_pattern_errors_instead_of_hanging() {
         assert!(error.contains("step limit"), "{error}");
         assert!(pack::tarball(dir.path()).is_err(), "nothing is packed");
     }
+}
+
+#[test]
+fn patterns_without_lookaround_run_in_linear_time() {
+    // These needed ~1e13 steps in a backtracking matcher; on the engine they run on
+    // regex-automata, so the pack lists the file at once (neither rule matches it).
+    let long = "b".repeat(200);
+    let dir = package(
+        &[
+            ("index.js", "console.log(1)\n"),
+            (&long, "x"),
+            (
+                ".npmignore",
+                "*b*b*b*b*b*b*b*c\n+(b|bb)+(b|bb)+(b|bb)+(b|bb)c\n",
+            ),
+        ],
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    );
+    let started = std::time::Instant::now();
+    let listed = pack::list(dir.path()).unwrap();
+    assert!(listed.iter().any(|f| f == &long), "{listed:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
 #[test]

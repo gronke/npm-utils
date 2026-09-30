@@ -38,6 +38,9 @@ sha1 = "0.10"
 # Format the SBOM generation timestamp as RFC 3339 (`sbom::now_rfc3339`). `time` is already in the
 # tree (via `zip`); this only adds its `formatting` feature — no new dependency.
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+# minimatch's regexes need lookahead (the `!(…)` groups), so `fancy-regex`; its backtrack limit turns a
+# hostile pattern into an error, and patterns without lookaround run on regex-automata. MSRV 1.66.
+fancy-regex = "0.19"
 
 # CLI only (feature `cli`); optional, so a default library build skips it. clap and its deps build
 # under the crate MSRV (1.88), which is set by `time`, not clap.
