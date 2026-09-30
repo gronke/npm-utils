@@ -33,6 +33,10 @@
 //!   install paths check it before trusting bytes).
 //! - [`sbom`] — render the packages a `package-lock.json` pins as a license summary, a CycloneDX
 //!   1.6 document, or an SPDX 2.3 document — compliance artifacts, pure Rust, no Node.
+//! - [`pack`]: the files a package directory publishes and their tarball, by npm-packlist's
+//!   rules, `npm pack` in pure Rust.
+//! - [`minimatch`]: npm's glob matcher (minimatch 10.2.5) on `fancy-regex`, with brace and
+//!   backtracking budgets and its quirks named and switchable; `pack` matches its rules with it.
 //! - [`audit`] — check those same pinned packages against vulnerability advisories from multiple
 //!   sources (npm's registry endpoint, OSV) behind a small source trait — `npm audit`, pure Rust.
 //!
@@ -68,6 +72,12 @@ pub mod download;
 pub mod extract;
 pub mod install;
 pub mod integrity;
+// minimatch 10.2.5 in Rust: the glob grammar npm, npm-packlist and ignore-walk share, matched
+// segment by segment on fancy-regex, with brace and backtracking budgets.
+pub mod minimatch;
+// `npm pack` in Rust: the publishable file list of a package directory by npm-packlist's rules,
+// and the `package/`-prefixed tarball with npm's fixed mtime and modes.
+pub mod pack;
 // The npm `package.json` / `package-lock.json` schemas — a pure-parsing module (no IO),
 // modeled on the npm specs, with strict spec-conformance tests living beside it.
 pub mod package_json;

@@ -142,7 +142,9 @@ pub(crate) fn validate_package_name(
 /// Reject versions outside the semver-adjacent alphabet, before the value ends
 /// up in a URL, a cache filename, or a marker — none of which should contain a
 /// path separator.
-fn validate_version(version: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn validate_version(
+    version: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if version.is_empty() || version.len() > 100 {
         return Err(format!("version {version:?} has invalid length").into());
     }

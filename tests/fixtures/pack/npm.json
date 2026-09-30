@@ -1,0 +1,84 @@
+{
+  "npm": "12.1.0",
+  "cases": {
+    "allowlist": [
+      "CHANGELOG.md",
+      "LICENSE-MIT",
+      "README.md",
+      "bin/demo.js",
+      "dist/index.js",
+      "dist/nested/types.d.ts",
+      "lib/a.js",
+      "notes.md",
+      "package.json"
+    ],
+    "directories-bin": [
+      "bin/cli.js",
+      "package.json"
+    ],
+    "entry-points-beat-ignores": [
+      "build/browser.js",
+      "build/cli.js",
+      "build/index.js",
+      "build/other.js",
+      "index.js",
+      "package.json"
+    ],
+    "extension-and-lockfiles": [
+      "index.js",
+      "package.json",
+      "sub/yarn.lock"
+    ],
+    "files-are-case-sensitive": [
+      "package.json",
+      "src/c.js"
+    ],
+    "files-directory-forms": [
+      "dist/c.js",
+      "dist/sub/d.js",
+      "lib/a.js",
+      "package.json",
+      "src/b.js",
+      "vendor/v.js"
+    ],
+    "files-globstar-and-braces": [
+      "a.js",
+      "lib/b.js",
+      "lib/types.d.ts",
+      "package.json"
+    ],
+    "files-later-inclusion-wins": [
+      "foo.js",
+      "index.js",
+      "package.json"
+    ],
+    "files-later-negation-wins": [
+      "index.js",
+      "package.json"
+    ],
+    "files-star-is-root-level": [
+      "a.js",
+      "package.json"
+    ],
+    "ignore-files-and-extglobs": [
+      "LICENCE",
+      "Readme",
+      "build/index.js",
+      "build/out.js",
+      "docs/keep.md",
+      "index.js",
+      "keep.log",
+      "lib/x.js",
+      "logs/keep/y.log",
+      "package.json",
+      "readme.md~",
+      "sub/x.js"
+    ],
+    "patched-dependencies": [
+      "index.js",
+      "package.json",
+      "patches/sub/z.patch",
+      "patches/y.patch"
+    ]
+  }
+}
