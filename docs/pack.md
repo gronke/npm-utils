@@ -29,6 +29,7 @@ The walk ports npm-packlist over ignore-walk, rule set by rule set:
    Below the root only `/.git` stays out.
 
 Rules are minimatch patterns under npm's options: a slash-less pattern matches a basename at any depth, a leading `/` anchors it, `**` spans directories, bracket classes with ranges and POSIX names apply, so do the extglob groups `@()`, `?()`, `*()`, `+()` and `!()`, braces `{a,b}` and `{1..3}` expand, case is folded, a leading `!` makes an inclusion.
+The matcher is the crate's `minimatch` module, minimatch 10.2.5 with negations evaluated without a backtracking engine, pinned by its own recorded fixture (`tests/minimatch.rs`).
 A child level first asks its parent about `dir/entry`, then applies its own rules; the last match decides.
 Only regular files ship; symlinks, special files and names carrying `*` are skipped.
 The order is npm-packlist's: extension, then basename, then path.
@@ -49,11 +50,46 @@ A package that means to publish these is broken or hostile.
 
 The packer fails closed past generous budgets, each error naming the rule line:
 
-- 10 000 brace alternatives and 100 brace groups per line; `{1..1000000000}` or sixteen `{a,b,c}` groups are an immediate error, where minimatch silently truncates past its own cap.
-- 1 000 000 backtracking steps per rule evaluation; `*b*b*b*b*b*b*b*c` or `+(b|bb)+(b|bb)+…` against a long name hangs minimatch 10.2.6 and `npm pack` 9.2.0 and 12.1.0, here it errors in milliseconds.
+- 10 000 brace alternatives, 100 brace groups and 4 000 000 expanded characters per line; `{1..1000000000}` or sixteen `{a,b,c}` groups are an immediate error, where minimatch silently truncates past its own cap.
+- 1 000 000 evaluator steps per path segment, a backstop for the polynomial worst case; the exponential classes of the JavaScript (`*b*b*b*b*b*b*b*c`, `+(b|bb)+(b|bb)+…`, `*(!(a))y` against a long name) do not exist here, because negation-free runs compile to linear regexes and `!()` groups evaluate as zero-width checks, so these patterns simply answer.
 - 64 directory levels; the walk and the filter recurse per level.
+- 128 nested extglob groups per pattern; adoption chains bypass the grammar's own depth guard, and a few hundred nested groups overflow a small stack where npm throws a RangeError.
+- 10 000 extglob nodes per line across its brace expansions, counted once every `!()` group has absorbed what follows it; sequential `!()` groups double that tree per group in npm's algorithm, so a twenty-group line costs millions of regexes there and is an error here.
+- 200 `**` sections crossed while one path is matched, where minimatch answers `false`.
+- 65 536 characters per rule line, minimatch's own limit.
 
 Many distinct just-under-budget rules cost linearly, not exponentially.
+Where the port answers differently from the JavaScript on purpose (characters instead of UTF-16 units, Unicode case folding under `nocase`, a POSIX class beside an escaped `-`), `tests/minimatch.rs` lists the cases.
+
+## Quirks
+
+The rules are read strictly by default: the matcher refuses by name what minimatch guesses at and honours escapes everywhere.
+`--npm-quirks` (`pack::Settings { quirks: true }`) reads them as npm does, quirks included, for a listing identical to npm's on any input; ordinary rules read the same either way, and the pinned npm listing checks both.
+The never-ship veto and the budgets hold in both modes.
+`npm_utils::minimatch::Quirk` names each quirk:
+
+- `negation-before-group`: npm reads a leading `!(` as negation, so `!(a|b)` negates a literal `(a|b)`, which no path matches.
+  Strict refuses it; `!@(a|b)` negates a group match, `@(!(a|b))` is the group.
+- `raw-extension-fast-path`: `*<ext>` and `?<ext>` compare the raw extension text, so `*\.js` matches `a\.js` and not `a.js`, and under `dot` the comparison takes `.` and `..`, so `*.` matches `..`.
+  Strict applies the regex, so the escape holds, `*\.js` matches `a.js`, and `.` and `..` stay out.
+- `escaped-pipe-alternates`: with other magic in the pattern, `\|` reaches the regex as an alternation, so `a*\|b` matches `a` and `xb`.
+  Strict keeps it a literal `|`.
+- `braces-strip-escapes`: brace expansion strips `\\`, `\{`, `\}`, `\,` and `\.`, but only when a `{…}` pair exists, so `a\\*` and `a\\*{b,c}` read the backslashes differently.
+  Strict lets the escapes survive expansion.
+- `posix-print-is-control`: `[[:print:]]` is `\p{C}`, the control and unassigned characters.
+  Strict: everything but `\p{C}` and the line and paragraph separators.
+- `posix-punct-skips-symbols`: `[[:punct:]]` is `\p{P}`, so `$`, `+`, `<`, `=`, `>`, `^`, `` ` ``, `|` and `~` are no punctuation.
+  Strict: `\p{P}\p{S}`.
+- `unmatchable-class-poisons`: a class that can match nothing (`[z-a]`, `[a-[:alpha:]]`) silently makes its whole segment match nothing.
+  Strict refuses it.
+- `unclosed-class-is-literal`: an unclosed `[` is a literal `[`.
+  Strict refuses it.
+- `unclosed-group-is-literal`: an unclosed group (`x*(`) is literal text.
+  Strict refuses it.
+- `unknown-posix-class-is-literal`: `[[:nope:]]` is a class of `[`, `:`, `n`, `o`, `p`, `e` and `:`, then a literal `]`.
+  Strict refuses it.
+
+The quirks live in minimatch (`isaacs/minimatch`) and brace-expansion (`juliangruber/brace-expansion`); the listing rules the never-ship veto deviates from live in `npm/npm-packlist` and `npm/ignore-walk`.
 
 ## The tarball
 

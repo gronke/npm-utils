@@ -35,6 +35,9 @@
 //!   1.6 document, or an SPDX 2.3 document — compliance artifacts, pure Rust, no Node.
 //! - [`pack`]: the files a package directory publishes and their tarball, by npm-packlist's
 //!   rules, `npm pack` in pure Rust.
+//! - [`minimatch`]: npm's glob matcher (minimatch 10.2.5), negations evaluated without a
+//!   backtracking engine, with brace, step, globstar and nesting budgets and its quirks named
+//!   and switchable; `pack` matches its rules with it.
 //! - [`audit`] — check those same pinned packages against vulnerability advisories from multiple
 //!   sources (npm's registry endpoint, OSV) behind a small source trait — `npm audit`, pure Rust.
 //!
@@ -70,6 +73,10 @@ pub mod download;
 pub mod extract;
 pub mod install;
 pub mod integrity;
+// minimatch 10.2.5 in Rust: the glob grammar npm, npm-packlist and ignore-walk share, with
+// negations evaluated without a backtracking engine and budgets on braces, globstars and
+// nesting.
+pub mod minimatch;
 // `npm pack` in Rust: the publishable file list of a package directory by npm-packlist's rules,
 // and the `package/`-prefixed tarball with npm's fixed mtime and modes.
 pub mod pack;

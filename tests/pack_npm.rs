@@ -233,12 +233,20 @@ fn fixture_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE)
 }
 
-/// This crate's listing of each case, as a sorted set of paths.
+/// This crate's listing of each case, as a sorted set of paths: npm's reading of the rules,
+/// after checking that the strict default lists the same, since no case uses quirky syntax.
 fn ours(case: &Case) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     materialize(case, dir.path());
-    let mut files = pack::list(dir.path()).unwrap();
+    let mut files = pack::list_with(dir.path(), &pack::Settings { quirks: true }).unwrap();
     files.sort();
+    let mut strict = pack::list(dir.path()).unwrap();
+    strict.sort();
+    assert_eq!(
+        strict, files,
+        "{}: the strict default reads these rules as npm does",
+        case.name
+    );
     files
 }
 

@@ -297,11 +297,12 @@ fn multiplicative_braces_fail_fast() {
 }
 
 #[test]
-fn a_pathological_ignore_pattern_errors_instead_of_hanging() {
-    // A 200-char name and patterns that need ~1e13 backtracking steps against it: the pack
-    // fails naming the rule, in milliseconds, instead of hanging.
-    let long = "b".repeat(200);
-    for line in ["*b*b*b*b*b*b*b*c", "+(b|bb)+(b|bb)+(b|bb)+(b|bb)c"] {
+fn a_pathological_ignore_pattern_evaluates_instead_of_hanging() {
+    // A 200-char name and a negated group under a repeat, which hangs the backtracking engine
+    // of the JavaScript: here the negation evaluates and the file simply ships (no `y`, no
+    // `c` at the end of the name).
+    let long = "a".repeat(200);
+    for line in ["*(!(a))y", "+(!(a)|b)c"] {
         let dir = package(
             &[
                 ("index.js", "console.log(1)\n"),
@@ -310,11 +311,96 @@ fn a_pathological_ignore_pattern_errors_instead_of_hanging() {
             ],
             r#"{"name":"demo","version":"1.0.0"}"#,
         );
-        let error = pack::list(dir.path()).unwrap_err().to_string();
-        assert!(error.contains(line), "{error}");
-        assert!(error.contains("step limit"), "{error}");
-        assert!(pack::tarball(dir.path()).is_err(), "nothing is packed");
+        let listed = pack::list(dir.path()).unwrap();
+        assert!(listed.iter().any(|f| f == &long), "{listed:?}");
+        assert!(pack::tarball(dir.path()).is_ok());
     }
+}
+
+#[test]
+fn patterns_without_lookaround_run_in_linear_time() {
+    // These needed ~1e13 steps in a backtracking matcher; on the engine they run on
+    // regex-automata, so the pack lists the file at once (neither rule matches it).
+    let long = "b".repeat(200);
+    let dir = package(
+        &[
+            ("index.js", "console.log(1)\n"),
+            (&long, "x"),
+            (
+                ".npmignore",
+                "*b*b*b*b*b*b*b*c\n+(b|bb)+(b|bb)+(b|bb)+(b|bb)c\n",
+            ),
+        ],
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    );
+    let started = std::time::Instant::now();
+    let listed = pack::list(dir.path()).unwrap();
+    assert!(listed.iter().any(|f| f == &long), "{listed:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn a_deeply_nested_rule_fails_instead_of_aborting() {
+    // Adoption chains never charge the parser's own depth guard: 800 nested groups overflow a
+    // small caller stack, so the nesting budget refuses the rule by name in both modes.
+    let mut line = "+(".repeat(200);
+    line.push('a');
+    line.push_str(&")".repeat(200));
+    let dir = package(
+        &[
+            ("index.js", "console.log(1)\n"),
+            (".npmignore", &format!("{line}\n")),
+        ],
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    );
+    for settings in [pack::Settings::default(), pack::Settings { quirks: true }] {
+        let error = pack::list_with(dir.path(), &settings)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&line[..40]), "{error}");
+        assert!(error.contains("nested groups"), "{error}");
+    }
+}
+
+#[test]
+fn the_default_refuses_what_npm_guesses_at() {
+    let manifest = r#"{"name":"demo","version":"1.0.0"}"#;
+    let npm = pack::Settings { quirks: true };
+    // npm reads `!(dist)` as the negation of a literal `(dist)`: a rule that matches nothing.
+    let dir = package(
+        &[
+            ("index.js", ""),
+            ("dist/x.js", ""),
+            (".npmignore", "!(dist)\n"),
+        ],
+        manifest,
+    );
+    let listed = pack::list_with(dir.path(), &npm).unwrap();
+    assert!(listed.iter().any(|f| f == "dist/x.js"), "{listed:?}");
+    let error = pack::list(dir.path()).unwrap_err().to_string();
+    // The ignore file's path leads, then the rule and the reason.
+    assert!(
+        error.ends_with(
+            ".npmignore: ignore rule \"!(dist)\": a leading `!(` is negation in npm and a group \
+             in Bash; write `!@(…)` to negate a group match or `@(!(…))` for the group"
+        ),
+        "{error}"
+    );
+    // `*\.js` compares the raw extension in npm; the strict default honours the escape.
+    let dir = package(
+        &[("a.js", ""), ("b.txt", ""), (".npmignore", "*\\.js\n")],
+        manifest,
+    );
+    let listed = pack::list_with(dir.path(), &npm).unwrap();
+    assert!(listed.iter().any(|f| f == "a.js"), "{listed:?}");
+    let listed = pack::list(dir.path()).unwrap();
+    assert!(listed.iter().all(|f| f != "a.js"), "{listed:?}");
+    assert!(listed.iter().any(|f| f == "b.txt"), "{listed:?}");
+    // The plan carries the setting the same way.
+    let plan = pack::Plan::with(dir.path(), &npm).unwrap();
+    assert!(plan.files().iter().any(|f| f == "a.js"));
+    let plan = pack::Plan::new(dir.path()).unwrap();
+    assert!(plan.files().iter().all(|f| f != "a.js"));
 }
 
 #[test]

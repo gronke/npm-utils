@@ -27,6 +27,7 @@ Composable modules — the full API is on **[docs.rs](https://docs.rs/npm-utils)
 | `sbom` | Render a committed lock as a license summary, CycloneDX 1.6, or SPDX 2.3. |
 | `pack` | A pure-Rust local packer pinned to npm 12's file selection: ordered `files` globs, `.npmignore`/`.gitignore`, the always-in and always-out sets, `package/`-prefixed entries with npm's mtime and modes, streamed with sha1 shasum and sha512 integrity. |
 | `audit` | Check a project, manifest/lockfile path, or `name=range` spec against vulnerability advisories (npm registry + OSV) behind a pluggable source trait. |
+| `minimatch` | minimatch 10.2.5 in Rust: globs, extglobs, POSIX classes and braces as npm reads them, negation-free runs on the `regex` crate and `!()` groups evaluated as zero-width checks, so no backtracking engine is involved; pinned by a fixture recorded from the JavaScript, with brace, step, globstar and nesting budgets that error instead of truncating or hanging; its ten quirks are named; `pack` reads rules strictly by default and as npm does under `--npm-quirks`. |
 | `cache` | Content-hash markers and a cross-process lock for skip-if-unchanged downloads. |
 | `path_safety` | The traversal/symlink hardening shared by `extract` and `install`. |
 

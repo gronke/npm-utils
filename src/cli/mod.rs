@@ -213,6 +213,9 @@ enum Command {
         /// Directory the tarball is written to (default: the current directory)
         #[arg(long, value_name = "DIR")]
         pack_destination: Option<PathBuf>,
+        /// Read the rules as npm does, quirks included, for a listing identical to npm's on any input; the default refuses ambiguous and unclosed syntax by name and honours escapes everywhere (docs/pack.md, "Quirks")
+        #[arg(long)]
+        npm_quirks: bool,
     },
     /// Bill of materials from package-lock.json: license summary, CycloneDX, or SPDX
     Sbom {
@@ -308,7 +311,8 @@ pub fn run(argv: impl IntoIterator<Item = OsString>) -> Res {
             dry_run,
             json,
             pack_destination,
-        } => pack::run(&dir, dry_run, json, pack_destination.as_deref()),
+            npm_quirks,
+        } => pack::run(&dir, dry_run, json, pack_destination.as_deref(), npm_quirks),
         Command::Sbom {
             dir,
             format,

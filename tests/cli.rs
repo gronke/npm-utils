@@ -405,10 +405,11 @@ fn pack_refuses_a_version_that_could_escape_the_destination() {
 
 #[test]
 fn pack_refuses_a_hostile_ignore_file() {
-    // A brace bomb and a backtracking bomb in `.npmignore` both fail the pack fast, naming the
-    // offending rule, and no tarball is written.
-    let long = "b".repeat(200);
-    for line in ["{1..100000000}", "*b*b*b*b*b*b*b*c"] {
+    // A brace bomb in `.npmignore` fails the pack fast, naming the offending rule, and no
+    // tarball is written. The negation bomb of the JavaScript evaluates here: the long file
+    // ships and the tarball is written.
+    let long = "a".repeat(200);
+    let project = |ignore: &str| {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
             project.path().join("package.json"),
@@ -417,23 +418,83 @@ fn pack_refuses_a_hostile_ignore_file() {
         .unwrap();
         std::fs::write(project.path().join("index.js"), "x").unwrap();
         std::fs::write(project.path().join(&long), "x").unwrap();
-        std::fs::write(project.path().join(".npmignore"), format!("{line}\n")).unwrap();
-        let out = npm_utils()
+        std::fs::write(project.path().join(".npmignore"), ignore).unwrap();
+        project
+    };
+    let pack = |project: &tempfile::TempDir| {
+        npm_utils()
             .args(["pack", project.path().to_str().unwrap()])
+            .current_dir(project.path())
             .output()
-            .unwrap();
-        assert!(!out.status.success(), "{line}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(line), "{stderr}");
-        assert!(
-            std::fs::read_dir(project.path()).unwrap().all(|e| !e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tgz")),
-            "no tarball is written"
-        );
-    }
+            .unwrap()
+    };
+    let tarballs = |project: &tempfile::TempDir| {
+        std::fs::read_dir(project.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tgz")
+            })
+            .count()
+    };
+
+    let bomb = project("{1..100000000}\n");
+    let out = pack(&bomb);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("{1..100000000}"), "{stderr}");
+    assert_eq!(tarballs(&bomb), 0, "no tarball is written");
+
+    let negation = project("*(!(a))y\n");
+    let out = pack(&negation);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(tarballs(&negation), 1);
+}
+
+#[test]
+fn pack_refuses_by_name_unless_npm_quirks_is_given() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(project.path().join("index.js"), "x").unwrap();
+    std::fs::write(project.path().join(".npmignore"), "!(dist)\n").unwrap();
+    let out = npm_utils()
+        .args(["pack", "--dry-run", "--json", "--npm-quirks"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = npm_utils()
+        .args(["pack", "--dry-run", "--json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("!(dist)"), "{stderr}");
+    assert!(stderr.contains("negation"), "{stderr}");
+    assert!(
+        std::fs::read_dir(project.path()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tgz")),
+        "no tarball is written"
+    );
 }
 
 #[test]

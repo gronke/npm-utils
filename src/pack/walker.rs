@@ -15,11 +15,13 @@
 //! on purpose, see docs/pack.md.
 
 use std::path::Path;
+use std::rc::Rc;
 
 use serde_json::Value;
 
 use super::collate;
-use super::pattern::{fold, Rule};
+use super::pattern::Rule;
+use super::Settings;
 use crate::Result;
 
 /// The depth the walk descends to. The walk and the rule filter recurse per level, and a few
@@ -97,6 +99,12 @@ const VETO_ROOT_FILES: &[&str] = &[
 /// The prefix of the root files vetoed by name: npm 12's `.npm-extension.mjs` and `.cjs`.
 const VETO_ROOT_PREFIX: &str = ".npm-extension.";
 
+/// One lowercase form per character for the never-ship veto, so a vetoed spelling cannot slip
+/// past in a different case.
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 fn folded_eq(a: &str, b: &str) -> bool {
     a.chars().map(fold).eq(b.chars().map(fold))
 }
@@ -131,23 +139,23 @@ struct Level {
     /// ignore-walk's `exact`: the directory passed as a file or as `dir/`, so an ancestor's
     /// exclusion does not settle its entries before this level's own rules run.
     exact: bool,
-    defaults: Vec<Rule>,
+    defaults: Rc<Vec<Rule>>,
     /// The `files` allowlist, root only.
     allowlist: Option<Vec<Rule>>,
     npmignore: Option<Vec<Rule>>,
     gitignore: Option<Vec<Rule>>,
-    strict: Vec<Rule>,
+    strict: Rc<Vec<Rule>>,
 }
 
 impl Level {
     /// The rule sets in consultation order, absent ones skipped.
     fn sets(&self) -> impl Iterator<Item = &Vec<Rule>> {
         [
-            Some(&self.defaults),
+            Some(&*self.defaults),
             self.allowlist.as_ref(),
             self.npmignore.as_ref(),
             self.gitignore.as_ref(),
-            Some(&self.strict),
+            Some(&*self.strict),
         ]
         .into_iter()
         .flatten()
@@ -165,16 +173,16 @@ impl Level {
     }
 }
 
-fn rules<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Result<Vec<Rule>> {
+fn rules<S: AsRef<str>>(lines: impl IntoIterator<Item = S>, quirks: bool) -> Result<Vec<Rule>> {
     lines
         .into_iter()
-        .map(|line| Rule::parse(line.as_ref()))
+        .map(|line| Rule::parse(line.as_ref(), quirks))
         .filter_map(Result::transpose)
         .collect()
 }
 
 /// The rules of `dir/<name>` when that ignore file exists.
-fn ignore_file(dir: &Path, name: &str) -> Result<Option<Vec<Rule>>> {
+fn ignore_file(dir: &Path, name: &str, quirks: bool) -> Result<Option<Vec<Rule>>> {
     let path = dir.join(name);
     if !path.is_file() {
         return Ok(None);
@@ -182,7 +190,7 @@ fn ignore_file(dir: &Path, name: &str) -> Result<Option<Vec<Rule>>> {
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     Ok(Some(
-        rules(text.lines()).map_err(|e| format!("{}: {e}", path.display()))?,
+        rules(text.lines(), quirks).map_err(|e| format!("{}: {e}", path.display()))?,
     ))
 }
 
@@ -194,13 +202,13 @@ struct IgnoreFiles {
 
 /// The ignore rules of `dir` in ignore-walk's precedence: none under an allowlist, the
 /// `.npmignore` when one is present, else the `.gitignore`. A file precedence drops is not read.
-fn ignore_files(dir: &Path, allowlisted: bool) -> Result<IgnoreFiles> {
+fn ignore_files(dir: &Path, allowlisted: bool, quirks: bool) -> Result<IgnoreFiles> {
     let (npmignore, gitignore) = if allowlisted {
         (None, None)
     } else if ignore_file_present(dir, ".npmignore") {
-        (ignore_file(dir, ".npmignore")?, None)
+        (ignore_file(dir, ".npmignore", quirks)?, None)
     } else {
-        (None, ignore_file(dir, ".gitignore")?)
+        (None, ignore_file(dir, ".gitignore", quirks)?)
     };
     Ok(IgnoreFiles {
         npmignore,
@@ -238,17 +246,25 @@ fn refuse_bundles(root: &Path, manifest: &Value) -> Result<()> {
 
 /// The files of the package at `root` that ship, `/`-separated and relative to it, in
 /// npm-packlist's order (extension, then basename, then path).
-pub(crate) fn walk(root: &Path, manifest: &Value) -> Result<Vec<String>> {
+pub(crate) fn walk(root: &Path, manifest: &Value, settings: &Settings) -> Result<Vec<String>> {
     refuse_bundles(root, manifest)?;
+    let quirks = settings.quirks;
     let RootRules {
         allowlist,
         strict,
         vetoed,
-    } = package_rules(root, manifest)?;
+    } = package_rules(root, manifest, quirks)?;
+    // The stock sets compile once; every level below the root shares them.
+    let shared = Shared {
+        defaults: Rc::new(rules(DEFAULTS, quirks)?),
+        strict: Rc::new(rules(STRICT_DEFAULTS, quirks)?),
+        quirks,
+        vetoed,
+    };
     let IgnoreFiles {
         npmignore,
         gitignore,
-    } = ignore_files(root, allowlist.is_some())?;
+    } = ignore_files(root, allowlist.is_some(), quirks)?;
     if gitignore.is_some() {
         crate::warn::warn(
             "no .npmignore file found, using .gitignore for file exclusion; a .npmignore \
@@ -258,18 +274,18 @@ pub(crate) fn walk(root: &Path, manifest: &Value) -> Result<Vec<String>> {
     let level = Level {
         basename: String::new(),
         exact: false,
-        defaults: rules(DEFAULTS)?,
+        defaults: Rc::clone(&shared.defaults),
         allowlist,
         npmignore,
         gitignore,
-        strict,
+        strict: Rc::new(strict),
     };
     let mut levels = vec![level];
     let mut out = Vec::new();
-    walk_dir(root, "", &mut levels, &vetoed, &mut out)?;
+    walk_dir(root, "", &mut levels, &shared, &mut out)?;
     // Backstop at the single choke point every inclusion mechanism flows through: nothing
     // vetoed leaves `walk`, whatever the rules decided.
-    out.retain(|path| !never_ship(path) && !vetoed.contains(path));
+    out.retain(|path| !never_ship(path) && !shared.vetoed.contains(path));
     out.sort_by(|a, b| packlist_order(a, b));
     Ok(out)
 }
@@ -283,7 +299,7 @@ struct RootRules {
     vetoed: Vec<String>,
 }
 
-fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
+fn package_rules(root: &Path, manifest: &Value, quirks: bool) -> Result<RootRules> {
     let mut strict: Vec<String> = STRICT_DEFAULTS
         .iter()
         .chain(ROOT_STRICT)
@@ -303,7 +319,7 @@ fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
             } else {
                 entry
             });
-            let Some(glob) = Rule::parse_glob(pattern)? else {
+            let Some(glob) = Rule::parse_glob(pattern, quirks)? else {
                 continue;
             };
             let prefix = if negation { "" } else { "!" };
@@ -318,7 +334,7 @@ fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
     let allowlist = if files.is_some() {
         let mut lines = vec!["*".to_string()];
         lines.extend(ignores.iter().cloned());
-        Some(rules(&lines)?)
+        Some(rules(&lines, quirks)?)
     } else {
         None
     };
@@ -366,7 +382,7 @@ fn package_rules(root: &Path, manifest: &Value) -> Result<RootRules> {
     }
     Ok(RootRules {
         allowlist,
-        strict: rules(&strict)?,
+        strict: rules(&strict, quirks)?,
         vetoed,
     })
 }
@@ -509,7 +525,7 @@ fn directory_bins(root: &Path, manifest: &Value) -> Vec<String> {
 
 /// Every file and directory beneath `dir`, recursively, `/`-joined onto `prefix`; entries whose
 /// name starts with a dot stay out, as npm's glob leaves them. Recursion stops at
-/// [`MAX_DEPTH]`, where the walk's own depth error takes over.
+/// [`MAX_DEPTH`], where the walk's own depth error takes over.
 fn collect_entries(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -549,12 +565,21 @@ fn secure_path(path: &str) -> String {
     segments.join("/")
 }
 
-/// `vetoed` holds the exact paths the veto covers: the patch files of `patchedDependencies`.
+/// The rule sets every level below the root uses as they are, and the mode its ignore files
+/// are read in.
+struct Shared {
+    defaults: Rc<Vec<Rule>>,
+    strict: Rc<Vec<Rule>>,
+    quirks: bool,
+    /// The exact paths the veto holds: the patch files of `patchedDependencies`.
+    vetoed: Vec<String>,
+}
+
 fn walk_dir(
     dir: &Path,
     rel: &str,
     levels: &mut Vec<Level>,
-    vetoed: &[String],
+    shared: &Shared,
     out: &mut Vec<String>,
 ) -> Result<()> {
     if levels.len() > MAX_DEPTH {
@@ -601,19 +626,19 @@ fn walk_dir(
             let IgnoreFiles {
                 npmignore,
                 gitignore,
-            } = ignore_files(&path, false)?;
+            } = ignore_files(&path, false, shared.quirks)?;
             levels.push(Level {
                 basename: name.clone(),
                 exact,
-                defaults: rules(DEFAULTS)?,
+                defaults: Rc::clone(&shared.defaults),
                 allowlist: None,
                 npmignore,
                 gitignore,
-                strict: rules(STRICT_DEFAULTS)?,
+                strict: Rc::clone(&shared.strict),
             });
-            walk_dir(&path, &child_rel, levels, vetoed, out)?;
+            walk_dir(&path, &child_rel, levels, shared, out)?;
             levels.pop();
-        } else if meta.is_file() && pass_file && !vetoed.contains(&child_rel) {
+        } else if meta.is_file() && pass_file && !shared.vetoed.contains(&child_rel) {
             out.push(child_rel);
         }
     }
@@ -716,7 +741,12 @@ mod tests {
 
     fn listed(dir: &Path, manifest: &str) -> Vec<String> {
         fs::write(dir.join("package.json"), manifest).unwrap();
-        walk(dir, &serde_json::from_str(manifest).unwrap()).unwrap()
+        walk(
+            dir,
+            &serde_json::from_str(manifest).unwrap(),
+            &crate::pack::Settings::default(),
+        )
+        .unwrap()
     }
 
     #[test]
