@@ -207,7 +207,7 @@ enum Command {
         /// Report only, write no tarball
         #[arg(long)]
         dry_run: bool,
-        /// Print npm's `pack --json` report on stdout instead of the notice block
+        /// Print the `pack --json` report on stdout instead of the notice block: npm 12's shape, an object keyed by the package name (npm 9 to 11 printed an array)
         #[arg(long)]
         json: bool,
         /// Directory the tarball is written to (default: the current directory)

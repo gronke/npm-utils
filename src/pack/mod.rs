@@ -759,4 +759,64 @@ mod tests {
         plain.sort_by(|a, b| collate(a, b, false));
         assert_eq!(plain, ["a10.js", "a2.js"]);
     }
+
+    #[test]
+    fn the_digests_describe_the_bytes() {
+        let dir = package(
+            &[("index.js", "module.exports = 1;\n")],
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        let tarball = tarball(dir.path()).unwrap();
+        assert_eq!(tarball.size as usize, tarball.bytes.len());
+        assert_eq!(
+            tarball.shasum,
+            format!("{:x}", Sha1::digest(&tarball.bytes))
+        );
+        assert_eq!(
+            tarball.integrity,
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tarball.bytes))
+            )
+        );
+        crate::integrity::verify("demo", &tarball.bytes, &tarball.integrity).unwrap();
+    }
+
+    #[test]
+    fn headers_carry_uid_gid_zero_and_no_owner_names() {
+        let dir = package(
+            &[("index.js", "1\n")],
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        let tarball = tarball(dir.path()).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball.bytes.as_slice()));
+        let mut seen = 0;
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let header = entry.header();
+            assert_eq!(header.entry_type(), tar::EntryType::Regular);
+            assert_eq!(header.uid().unwrap(), 0);
+            assert_eq!(header.gid().unwrap(), 0);
+            assert_eq!(header.username().unwrap().unwrap_or(""), "");
+            assert_eq!(header.groupname().unwrap().unwrap_or(""), "");
+            assert_eq!(header.mtime().unwrap(), MTIME);
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
+    }
+
+    #[test]
+    fn the_gzip_stream_is_level_nine_without_a_timestamp() {
+        let dir = package(
+            &[("index.js", "1\n")],
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        );
+        let bytes = tarball(dir.path()).unwrap().bytes;
+        // RFC 1952: the magic, deflate, no flags, a zero mtime, XFL 2 (maximum compression) and
+        // OS 255 (unknown); the digests describe this header as much as the payload.
+        assert_eq!(
+            &bytes[..10],
+            &[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x02, 0xff]
+        );
+    }
 }

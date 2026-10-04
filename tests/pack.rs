@@ -602,3 +602,98 @@ fn a_path_longer_than_ustar_round_trips() {
         "the long path round-trips"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_package_is_skipped() {
+    let dir = package(&[("index.js", "")], r#"{"name":"demo","version":"1.0.0"}"#);
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.path().join("pipe"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo");
+    assert_eq!(
+        pack::list(dir.path()).unwrap(),
+        ["index.js", "package.json"]
+    );
+    pack::tarball(dir.path()).unwrap();
+}
+
+#[test]
+fn node_modules_never_ships_at_any_depth() {
+    // npm anchors its node_modules rule at the root and ships a nested one; this crate vetoes
+    // the name at any depth, since bundled dependencies are not gathered (docs/pack.md).
+    let dir = package(
+        &[
+            ("lib/index.js", ""),
+            ("lib/node_modules/dep/index.js", "NESTED_TOKEN"),
+            ("lib/node_modules/dep/package.json", "{}"),
+        ],
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    );
+    assert_never_ships(
+        dir.path(),
+        &[
+            "lib/node_modules/dep/index.js",
+            "lib/node_modules/dep/package.json",
+        ],
+        "NESTED_TOKEN",
+    );
+    assert!(pack::list(dir.path())
+        .unwrap()
+        .contains(&"lib/index.js".to_string()));
+}
+
+#[test]
+fn main_cannot_ship_a_root_npm_extension() {
+    let dir = package(
+        &[
+            (
+                ".npm-extension.mjs",
+                "export function transformManifest(m) { return m }\n",
+            ),
+            ("index.js", ""),
+        ],
+        r#"{"name":"demo","version":"1.0.0","main":".npm-extension.mjs"}"#,
+    );
+    assert_never_ships(dir.path(), &[".npm-extension.mjs"], "transformManifest");
+}
+
+#[test]
+fn a_nested_negation_cannot_ship_a_patch_file() {
+    let dir = package(
+        &[
+            ("patches/x.patch", "PATCH_TOKEN"),
+            ("patches/.npmignore", "!x.patch\n"),
+            ("index.js", ""),
+        ],
+        r#"{"name":"demo","version":"1.0.0","files":["patches","index.js"],"patchedDependencies":{"x@1":"patches/x.patch"}}"#,
+    );
+    assert_never_ships(dir.path(), &["patches/x.patch"], "PATCH_TOKEN");
+}
+
+#[test]
+fn a_manifest_declaring_bundled_dependencies_is_refused() {
+    for bundle in [
+        r#""bundleDependencies":["x"]"#,
+        r#""bundledDependencies":["x"]"#,
+        r#""bundleDependencies":true"#,
+    ] {
+        let dir = package(
+            &[("index.js", "")],
+            &format!(r#"{{"name":"demo","version":"1.0.0",{bundle}}}"#),
+        );
+        let err = npm_utils::pack::list(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("bundled dependencies"), "{bundle}: {err}");
+    }
+    for bundle in [
+        r#""bundleDependencies":[]"#,
+        r#""bundleDependencies":false"#,
+    ] {
+        let dir = package(
+            &[("index.js", "")],
+            &format!(r#"{{"name":"demo","version":"1.0.0",{bundle}}}"#),
+        );
+        assert!(npm_utils::pack::list(dir.path()).is_ok(), "{bundle}");
+    }
+}

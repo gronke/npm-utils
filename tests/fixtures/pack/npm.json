@@ -12,8 +12,38 @@
       "notes.md",
       "package.json"
     ],
+    "bin-array-keyed-by-basename": [
+      "package.json",
+      "three/cli.js",
+      "two/run.js"
+    ],
+    "bin-string-and-nested-manifest": [
+      "cli.js",
+      "package.json",
+      "sub/lib/deep.js",
+      "sub/package.json"
+    ],
+    "copying-and-dot-slash-entry-points": [
+      "COPYING",
+      "COPYING.txt",
+      "LICENCE",
+      "README~",
+      "index.js",
+      "license.md",
+      "package.json",
+      "readme.markdown"
+    ],
+    "default-rules-on-disk": [
+      "build/keep.js",
+      "index.js",
+      "package.json",
+      "sub/keep.js"
+    ],
     "directories-bin": [
       "bin/cli.js",
+      "package.json"
+    ],
+    "empty-bin-object-keeps-directories-bin-unexpanded": [
       "package.json"
     ],
     "entry-points-beat-ignores": [
@@ -60,6 +90,10 @@
       "a.js",
       "package.json"
     ],
+    "gitignore-under-npmignore-is-not-read": [
+      "index.js",
+      "package.json"
+    ],
     "ignore-files-and-extglobs": [
       "LICENCE",
       "Readme",
@@ -74,11 +108,26 @@
       "readme.md~",
       "sub/x.js"
     ],
+    "nested-ignores-under-files": [
+      "lib/a.js",
+      "lib/sub/b.js",
+      "package.json"
+    ],
     "patched-dependencies": [
       "index.js",
       "package.json",
       "patches/sub/z.patch",
       "patches/y.patch"
+    ],
+    "root-gitignore-fallback": [
+      "index.js",
+      "lib/a.js",
+      "package.json"
+    ],
+    "silenced-ignore-files-are-not-read": [
+      "dist/index.js",
+      "package.json",
+      "sub/a.js"
     ]
   }
 }

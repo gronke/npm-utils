@@ -1,4 +1,3 @@
-#![cfg(feature = "cli")]
 //! The pinned differential specification of the listing: every case below is a small package
 //! tree, and `tests/fixtures/pack/npm.json` records the files a pinned npm (`npm pack --dry-run
 //! --json`) publishes for it. The ordinary test holds this crate's listing to that record on
@@ -7,7 +6,7 @@
 //! matcher and walker acquire in silence.
 //!
 //! ```text
-//! PATH=/path/to/npm-12/bin:$PATH cargo test --features cli --test pack_npm -- --ignored
+//! PATH=/path/to/npm-12/bin:$PATH cargo test --test pack_npm -- --ignored
 //! ```
 //!
 //! The cases stay within what npm and this crate agree on: the never-ship veto (docs/pack.md)
@@ -170,6 +169,121 @@ const CASES: &[Case] = &[
             ("build/other.js", ""),
             ("index.js", ""),
             (".npmignore", "build\n"),
+        ],
+    },
+    Case {
+        name: "root-gitignore-fallback",
+        manifest: r#"{"name":"demo","version":"1.0.0"}"#,
+        files: &[
+            (".gitignore", "build\n*.log\n"),
+            ("build/out.js", ""),
+            ("debug.log", ""),
+            ("lib/a.js", ""),
+            ("index.js", ""),
+        ],
+    },
+    Case {
+        name: "nested-ignores-under-files",
+        manifest: r#"{"name":"demo","version":"1.0.0","files":["lib"]}"#,
+        files: &[
+            (".npmignore", "lib\n"),
+            ("lib/.npmignore", "*.test.js\n"),
+            ("lib/a.js", ""),
+            ("lib/a.test.js", ""),
+            ("lib/sub/.gitignore", "tmp.js\n"),
+            ("lib/sub/b.js", ""),
+            ("lib/sub/tmp.js", ""),
+            ("other/x.js", ""),
+        ],
+    },
+    Case {
+        name: "copying-and-dot-slash-entry-points",
+        manifest: r#"{"name":"demo","version":"1.0.0","main":"./lib/main.js","browser":"./lib/browser.js"}"#,
+        files: &[
+            ("COPYING", ""),
+            ("COPYING.txt", ""),
+            ("LICENCE", ""),
+            ("license.md", ""),
+            ("readme.markdown", ""),
+            ("README~", ""),
+            ("lib/main.js", ""),
+            ("lib/browser.js", ""),
+            ("lib/other.js", ""),
+            ("index.js", ""),
+            (".npmignore", "lib\n"),
+        ],
+    },
+    Case {
+        name: "default-rules-on-disk",
+        manifest: r#"{"name":"demo","version":"1.0.0"}"#,
+        files: &[
+            ("npm-debug.log", ""),
+            ("sub/npm-debug.log", ""),
+            (".foo.swp", ""),
+            ("._resource", ""),
+            (".lock-wscript", ""),
+            (".wafpickle-7", ""),
+            ("build/config.gypi", ""),
+            ("build/keep.js", ""),
+            ("archived-packages/old.tgz", ""),
+            (".DS_Store", ""),
+            ("sub/.DS_Store", ""),
+            ("notes.orig", ""),
+            (".svn/entries", ""),
+            ("sub/.hg/store", ""),
+            ("CVS/Root", ""),
+            ("sub/CVS/Entries", ""),
+            ("sub/keep.js", ""),
+            ("index.js", ""),
+        ],
+    },
+    Case {
+        name: "bin-string-and-nested-manifest",
+        manifest: r#"{"name":"@acme/tool","version":"2.0.0","bin":"cli.js"}"#,
+        files: &[
+            ("cli.js", ""),
+            ("sub/package.json", "{\"name\":\"inner\"}"),
+            ("sub/index.js", ""),
+            ("sub/lib/deep.js", ""),
+            (".npmignore", "cli.js\nsub/index.js\n"),
+        ],
+    },
+    Case {
+        name: "silenced-ignore-files-are-not-read",
+        manifest: r#"{"name":"demo","version":"1.0.0","files":["dist","sub"]}"#,
+        files: &[
+            ("dist/index.js", ""),
+            (".npmignore", "[unfinished\n"),
+            (".gitignore", "[unfinished\n"),
+            ("sub/a.js", ""),
+            ("sub/a.log", ""),
+            ("sub/.npmignore", "*.log\n"),
+            ("sub/.gitignore", "[unfinished\n"),
+        ],
+    },
+    Case {
+        name: "gitignore-under-npmignore-is-not-read",
+        manifest: r#"{"name":"demo","version":"1.0.0"}"#,
+        files: &[
+            ("index.js", ""),
+            ("keep.log", ""),
+            (".npmignore", "*.log\n"),
+            (".gitignore", "[unfinished\n"),
+        ],
+    },
+    Case {
+        name: "empty-bin-object-keeps-directories-bin-unexpanded",
+        manifest: r#"{"name":"demo","version":"1.0.0","files":[],"bin":{},"directories":{"bin":"tools"}}"#,
+        files: &[("tools/run.js", ""), ("index.js", "")],
+    },
+    Case {
+        name: "bin-array-keyed-by-basename",
+        manifest: r#"{"name":"demo","version":"1.0.0","files":[],"bin":["one/run.js","two/run.js","three/cli.js"]}"#,
+        files: &[
+            ("one/run.js", ""),
+            ("two/run.js", ""),
+            ("three/cli.js", ""),
+            ("index.js", ""),
         ],
     },
 ];

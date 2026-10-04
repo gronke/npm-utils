@@ -23,7 +23,8 @@ The walk ports npm-packlist over ignore-walk, rule set by rule set:
    Globs are case-sensitive, `dot` is on, symlinks match nothing, a pattern without `**` reaches its own depth only.
    An allowlist silences the root's `.npmignore` and `.gitignore`.
 3. `.npmignore`, else `.gitignore`, of the directory, at every level; a file precedence drops is not read.
-4. The strict set at the root: `package.json`, `README*`, `COPYING*`, `LICENSE*` and `LICENCE*` (any case, `~` and `$` backups excluded) and the `main`, `browser` and `bin` targets are always in.
+4. The strict set at the root: `package.json`, `README*`, `COPYING*`, `LICENSE*` and `LICENCE*` (any case, `~` and `$` backups not among them) and the `main`, `browser` and `bin` targets are always in.
+   `main` and `browser` count as written: a `./lib/index.js` is not normalized, so an ignore rule on `lib` still excludes it, as npm-packlist 11.3.0 reads it (the `copying-and-dot-slash-entry-points` case pins this).
    `.git`, `node_modules`, `.npmrc`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `.npm-extension.mjs`, `.npm-extension.cjs` and the patch files of `patchedDependencies` are always out, the last with a warning when a `files` entry pulled one in.
    `bin` is read as npm normalizes it: a string is the one bin, an array is keyed by basename and a later entry replaces an earlier one under the same basename, an object by its keys, paths made relative; without a `bin`, the entries beneath `directories.bin` stand in, dotfiles excluded, symlinks not followed; a `bin` of any kind, an empty object included, leaves `directories.bin` unexpanded.
    Below the root only `/.git` stays out.

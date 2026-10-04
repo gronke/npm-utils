@@ -277,8 +277,12 @@ fn pack_dry_run_reports_the_files_npm_would_ship() {
     let project = tempfile::tempdir().unwrap();
     pack_fixture(project.path());
     let dir = project.path().to_str().unwrap();
+    // The working directory is the package, so a dry run that wrote its tarball to `.` would
+    // land where the assertion below looks.
     let stdout = run(
-        npm_utils().args(["pack", dir, "--dry-run", "--json"]),
+        npm_utils()
+            .current_dir(project.path())
+            .args(["pack", dir, "--dry-run", "--json"]),
         "pack --dry-run --json",
     );
     let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -626,4 +630,65 @@ fn pack_listing_matches_npm() {
         };
         assert_eq!(paths(&ours), paths(&theirs), "{}", dir.display());
     }
+}
+
+#[test]
+fn pack_creates_a_missing_destination_directory() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let dest = project.path().join("out").join("nested");
+    let stdout = run(
+        npm_utils().args([
+            "pack",
+            project.path().to_str().unwrap(),
+            "--pack-destination",
+            dest.to_str().unwrap(),
+        ]),
+        "pack --pack-destination",
+    );
+    assert_eq!(stdout.trim(), "acme-demo-1.2.3.tgz");
+    assert!(dest.join("acme-demo-1.2.3.tgz").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_refuses_to_write_through_a_planted_symlink() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "untouched").unwrap();
+    let dest = project.path().join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let planted = dest.join("acme-demo-1.2.3.tgz");
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+    let out = npm_utils()
+        .args([
+            "pack",
+            project.path().to_str().unwrap(),
+            "--pack-destination",
+            dest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a symlink planted at the destination is refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("symlink"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    assert!(
+        std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link itself is left alone"
+    );
+}
+
+#[test]
+fn pack_help_names_the_npm_12_report_shape() {
+    let stdout = run(npm_utils().args(["pack", "--help"]), "pack --help");
+    assert!(stdout.contains("npm 12"), "{stdout}");
 }
