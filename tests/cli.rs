@@ -14,10 +14,23 @@
 
 use std::process::Command;
 
-/// The CLI binary. Cargo sets `CARGO_BIN_EXE_npm-utils` because the bin's `required-features`
-/// (`cli`) are active for this test build.
+/// The CLI binary. Cargo sets `CARGO_BIN_EXE_npm-utils` while it compiles this test when the
+/// bin is part of the same build (its `required-features`, `cli`, are active); when the test is
+/// built on its own, the bin still lands beside the test executables, so the path is derived
+/// from this executable's: `target/<profile>/deps/cli-<hash>` to `target/<profile>/npm-utils`.
 fn npm_utils() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_npm-utils"))
+    let path = match option_env!("CARGO_BIN_EXE_npm-utils") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let test = std::env::current_exe().expect("the test executable's path");
+            let profile = test
+                .parent()
+                .and_then(|deps| deps.parent())
+                .expect("target/<profile>/deps/<test>");
+            profile.join(format!("npm-utils{}", std::env::consts::EXE_SUFFIX))
+        }
+    };
+    Command::new(path)
 }
 
 fn run(cmd: &mut Command, what: &str) -> String {

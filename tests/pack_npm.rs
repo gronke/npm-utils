@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! PATH=/path/to/npm-12/bin:$PATH cargo test --test pack_npm -- --ignored
+//! PATH=ci/sealed-node/bin:$PATH cargo test --test pack_npm -- --ignored   # npm 12.1.0, sealed
 //! ```
 //!
 //! The cases stay within what npm and this crate agree on: the never-ship veto (docs/pack.md)

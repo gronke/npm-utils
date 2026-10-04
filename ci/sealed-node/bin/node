@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# `node` from the sealed container, for the two tests in tests/minimatch.rs that need the
+# JavaScript minimatch itself: the recorder that writes tests/fixtures/minimatch/minimatch.json
+# and the live differential over generated patterns. Both run `node -e <script>` with their
+# cases on stdin and read JSON back on stdout, resolving `require("minimatch")` through
+# NODE_PATH, so every recorded answer comes from the pinned minimatch 10.2.5 under a pinned node
+# and nothing else, whatever the runner has installed.
+# The container is node:24-slim by digest (see ./npm), without network, as the calling user, with
+# every capability dropped and a read-only root. NODE_PATH passes through, and the directory it
+# names ($SEALED_NODE_MODULES, holding minimatch 10.2.5) is mounted read-only at the same path;
+# the working directory is mounted read-only too, since the scripts touch no file.
+set -euo pipefail
+: "${NODE_IMAGE:?NODE_IMAGE (node:24-slim@sha256:…) is not set}"
+mounts=(-v "$PWD:/data:ro")
+if [ -n "${SEALED_NODE_MODULES:-}" ]; then mounts+=(-v "$SEALED_NODE_MODULES:$SEALED_NODE_MODULES:ro"); fi
+exec docker run --rm -i --network none \
+  --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+  --read-only --tmpfs /tmp:exec \
+  -e HOME=/tmp ${NODE_PATH:+-e NODE_PATH} \
+  "${mounts[@]}" -w /data \
+  --entrypoint node "$NODE_IMAGE" "$@"

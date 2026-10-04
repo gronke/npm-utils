@@ -109,3 +109,10 @@ The digests describe this crate's gzip stream; npm's zlib writes different bytes
 No workspaces, no lifecycle scripts, no package specs, no global ignore file; a manifest declaring bundled dependencies is refused; a top-level entry starting with `@` is listed under its own name (npm prefixes `./`).
 Bundled dependencies are the gap worth closing next, on the install machinery this crate has.
 The recorded fixture and the ignored live comparison stay within what npm and this crate agree on; the veto is covered by `tests/pack.rs`.
+
+## Tests
+
+Three layers hold the port to npm.
+`tests/pack_npm.rs` pins the listing of seventeen trees to a record of npm 12.1.0, and `tests/minimatch.rs` the matcher to answers recorded from minimatch 10.2.5, both offline on every run; the ignored recorders rewrite the records from the tools on PATH.
+`tests/pack_e2e.rs` packs real packages: twelve fetched from git at their release commit, held file by file to npm 12.1.0's listing and to the registry's tarball, and twenty registry tarballs unpacked and packed again, build steps and scopes included; three of the tarballs go through `npm install`.
+The `pack-e2e` CI job runs the recorders, the generated differential and the corpora with npm 12.1.0 and minimatch 10.2.5 inside a digest-pinned node container without network (`ci/sealed-node`, shims on PATH; the minimatch tree is installed from the committed lockfile by this crate's own `ci` verb), then requires the committed records to reproduce.
