@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 
 - REUSE: every file names its licence and copyright holder through `REUSE.toml` and `LICENSES/`, checked by a `reuse lint` job; the published crate carries both.
 - docs: `docs/sources.md` lists what each module follows and the registry's terms the crate works under; the README states the project's independence from npm, Inc.
+- download: every request identifies itself as `npm-utils/<version> (https://github.com/gronke/npm-utils)`, and the one retry waits for the `Retry-After` a 429 or 503 names, capped at 30 seconds.
 
 ## [0.6.2] - 2026-07-22
 
