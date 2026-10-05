@@ -144,6 +144,12 @@ jobs:
       - name: The pinned records reproduce
         run: git diff --exit-code -- tests/fixtures
 
+      # The property tests at depth: the checks matrix runs 256 cases per property, this run 4096.
+      - name: The property tests, 4096 cases per property
+        run: cargo test --test minimatch_props
+        env:
+          PROPTEST_CASES: "4096"
+
   package:
     name: publish dry-run
     runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}

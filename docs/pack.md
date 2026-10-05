@@ -112,7 +112,8 @@ The recorded fixture and the ignored live comparison stay within what npm and th
 
 ## Tests
 
-Three layers hold the port to npm.
-`tests/pack_npm.rs` pins the listing of seventeen trees to a record of npm 12.1.0, and `tests/minimatch.rs` the matcher to answers recorded from minimatch 10.2.5, both offline on every run; the ignored recorders rewrite the records from the tools on PATH.
+Three layers hold the port to npm, and a fourth holds it to itself.
+`tests/pack_npm.rs` pins the listing of twenty-one trees to a record of npm 12.1.0, and `tests/minimatch.rs` the matcher to answers recorded from minimatch 10.2.5, both offline on every run; the ignored recorders rewrite the records from the tools on PATH.
 `tests/pack_e2e.rs` packs real packages: twelve fetched from git at their release commit, held file by file to npm 12.1.0's listing and to the registry's tarball, and twenty registry tarballs unpacked and packed again, build steps and scopes included; three of the tarballs go through `npm install`.
 The `pack-e2e` CI job runs the recorders, the generated differential and the corpora with npm 12.1.0 and minimatch 10.2.5 inside a digest-pinned node container without network (`ci/sealed-node`, shims on PATH; the minimatch tree is installed from the committed lockfile by this crate's own `ci` verb), then requires the committed records to reproduce.
+`tests/minimatch_props.rs` draws patterns from a grammar with proptest (`tests/common/glob_grammar.rs`, which also feeds the live differential) and checks what must hold for every one: a compile that ends with a result or a named error, a path from the pattern's own language that matches it, `!` as the complement, `nocase` and `dot` only adding matches, strict and quirks agreeing where no quirk is involved, escapes round-tripping; 256 cases per property on every run, 4096 in the pack-e2e job, and a failing case lands in `proptest-regressions/` to be replayed first.

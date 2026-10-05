@@ -13,13 +13,18 @@
 //! (`$(npm root -g)/npm/node_modules`). The few answers the port gives on purpose against the
 //! record are listed in `KNOWN_DIVERGENCES` with their reason.
 //!
-//! The second ignored test generates 1500 patterns and compares the answers live, since the
-//! port evaluates negations structurally where the JavaScript runs a lookahead.
+//! The second ignored test draws 1500 patterns from the grammar the property tests use
+//! (`common/glob_grammar.rs`) and compares the answers live, since the port evaluates negations
+//! structurally where the JavaScript runs a lookahead.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use npm_utils::minimatch::{brace_expand, Minimatch, Options};
+use npm_utils::minimatch::{brace_expand, Error, Minimatch, Options};
+
+#[allow(dead_code)]
+mod common;
+use common::glob_grammar::{self, Grammar};
 
 const FIXTURE: &str = "tests/fixtures/minimatch/minimatch.json";
 
@@ -972,136 +977,56 @@ fn record_the_pinned_minimatch() {
     .write();
 }
 
-/// A tiny deterministic generator: xorshift over pattern items and short names.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn pick<'a>(&mut self, items: &'a [&'a str]) -> &'a str {
-        items[(self.next() as usize) % items.len()]
-    }
+/// Whether a segment of `pattern` holds a POSIX class beside a `-` or an escaped `,`, `!`, `#`
+/// or space: the JavaScript compiles such a segment with the `u` flag, under which the escape
+/// it writes for the character is a `SyntaxError`, where the port reads the character. The `-`
+/// may be one an unknown class name (`[:nope:]`) left outside the class.
+fn uflag_syntax_error(pattern: &str) -> bool {
+    pattern.split('/').any(|segment| {
+        segment.contains("[:")
+            && (segment.contains('-')
+                || ["\\,", "\\!", "\\#", "\\ "]
+                    .iter()
+                    .any(|escape| segment.contains(escape)))
+    })
 }
 
-const ATOMS: &[&str] = &[
-    "a", "b", "c", "x", "é", ".", ".a", ".*", "*", "?", "[ab]", "[!a]", "[a-c]", "\\*", "x.js",
-    "\\|",
-];
-const KINDS: &[&str] = &["@", "?", "*", "+", "!"];
-
-/// The names every generated pattern meets: dot corners, alternation fodder and the names the
-/// pinned cases ask about.
-const NAMES: &[&str] = &[
-    "",
-    "a",
-    "b",
-    "c",
-    "x",
-    "y",
-    ".",
-    "..",
-    ".a",
-    ".x",
-    "a.",
-    "aa",
-    "ab",
-    "ba",
-    "aab",
-    "aba",
-    "abc",
-    "abd",
-    "ac",
-    "axb",
-    "bc",
-    "xb",
-    "xbc",
-    "xy",
-    "xyz",
-    "ababab",
-    "a|b",
-    "(a)",
-    "a.js",
-    "a.ts",
-    "a.jsx",
-    "a.b",
-    "readme.md~",
-    "secret.pem",
-    "certs",
-    "xay",
-    "xby",
-    "xaby",
-    "bbc",
-    "d",
-    "aaay",
-];
-
-fn gen_item(rng: &mut Rng, depth: usize, out: &mut String) {
-    let roll = rng.next() % 100;
-    if depth >= 3 || roll < 62 {
-        out.push_str(rng.pick(ATOMS));
-        return;
-    }
-    let kind = rng.pick(KINDS);
-    out.push_str(kind);
-    out.push('(');
-    let alternatives = 1 + (rng.next() as usize) % 2;
-    for a in 0..alternatives {
-        if a > 0 {
-            out.push('|');
-        }
-        let items = (rng.next() as usize) % 3;
-        for _ in 0..=items {
-            gen_item(rng, depth + 1, out);
-        }
-    }
-    out.push(')');
-}
-
-fn gen_pattern(rng: &mut Rng) -> String {
-    let mut out = String::new();
-    let items = 1 + (rng.next() as usize) % 4;
-    for _ in 0..items {
-        gen_item(rng, 0, &mut out);
-    }
-    out
-}
-
-fn gen_name(rng: &mut Rng) -> String {
-    let mut out = String::new();
-    let len = (rng.next() as usize) % 5;
-    for _ in 0..len {
-        out.push_str(rng.pick(&["a", "b", "c", "."]));
-    }
-    out
-}
-
-/// Generated patterns against the live minimatch. The port evaluates negations as zero-width
-/// checks where the JavaScript runs a lookahead, so beyond the pinned cases this holds the two
-/// to each other on 1500 patterns under the default, `dot` and `nocase` presets.
+/// Generated patterns against the live minimatch, drawn from the grammar the property tests
+/// use (`common/glob_grammar.rs`) with a fixed seed, quirks included: classes, braces, extglobs,
+/// globstars and several segments, under five presets, partial mode in a fifth of the cases.
+/// The port evaluates negations as zero-width checks where the JavaScript runs a lookahead, so
+/// beyond the pinned cases this holds the two to each other on 1500 patterns.
 #[test]
 #[ignore = "needs node: compares generated patterns against minimatch live"]
 fn agrees_with_minimatch_on_generated_patterns() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+
     let node_path = node_path();
-    let mut rng = Rng(0x9E3779B97F4A7C15);
-    let mut generated: Vec<(String, Preset, Vec<String>)> = Vec::new();
+    let seed = b"npm-utils minimatch differential";
+    let mut runner = TestRunner::new_with_rng(
+        Config::default(),
+        TestRng::from_seed(RngAlgorithm::ChaCha, seed),
+    );
+    let strategy = (
+        glob_grammar::pattern(Grammar::DIFFERENTIAL),
+        proptest::sample::select(vec![Default, Dot, Nocase, MatchBase, Ignore]),
+        proptest::bool::weighted(0.2),
+        proptest::collection::vec(glob_grammar::arbitrary_path(), 4),
+    );
+    let mut generated: Vec<(String, Preset, bool, Vec<String>)> = Vec::new();
     for _ in 0..1500 {
-        let pattern = gen_pattern(&mut rng);
-        let preset = [Default, Dot, Nocase][(rng.next() as usize) % 3];
-        let mut names: Vec<String> = NAMES.iter().map(|n| n.to_string()).collect();
-        names.extend((0..4).map(|_| gen_name(&mut rng)));
-        generated.push((pattern, preset, names));
+        let (pattern, preset, partial, extra) = strategy.new_tree(&mut runner).unwrap().current();
+        let mut names: Vec<String> = glob_grammar::NAMES.iter().map(|n| n.to_string()).collect();
+        names.extend(extra);
+        generated.push((pattern.render(), preset, partial, names));
     }
     let cases: Vec<serde_json::Value> = generated
         .iter()
-        .flat_map(|(pattern, preset, names)| {
+        .flat_map(|(pattern, preset, partial, names)| {
             names
                 .iter()
-                .map(move |name| case_json(pattern, name, *preset, false))
+                .map(move |name| case_json(pattern, name, *preset, *partial))
         })
         .collect();
     let recorded = ask_minimatch(&node_path, &cases, &[]);
@@ -1109,18 +1034,37 @@ fn agrees_with_minimatch_on_generated_patterns() {
     assert_eq!(answers.len(), cases.len());
     let mut answers = answers.iter();
     let mut disagreements = Vec::new();
-    for (pattern, preset, names) in &generated {
+    let mut budgets = 0usize;
+    for (pattern, preset, partial, names) in &generated {
         let mm = Minimatch::new(pattern, preset.options());
         for name in names {
             let theirs = Answer::from_json(&answers.next().unwrap()[4]);
-            let mine = match &mm {
-                Ok(mm) => mm.is_match(name).map_or(Answer::Error, Answer::Bool),
+            let answer = match &mm {
+                Ok(mm) if *partial => mm.is_match_partial(name),
+                Ok(mm) => mm.is_match(name),
+                Err(e) => Err(e.clone()),
+            };
+            let mine = match answer {
+                Ok(hit) => Answer::Bool(hit),
+                // A budget is a named outcome of the port where minimatch computes on: a
+                // generated pattern with thousands of brace expansions, each holding groups,
+                // crosses the node budget. Counted, so the budgets stay out of the way.
+                Err(Error::Braces { .. } | Error::Nodes { .. } | Error::Steps { .. }) => {
+                    budgets += 1;
+                    continue;
+                }
                 Err(_) => Answer::Error,
             };
+            if theirs == Answer::Error && mine != Answer::Error && uflag_syntax_error(pattern) {
+                // The documented divergence: a POSIX class beside an escaped `-`, `,`, `!`, `#`
+                // or space is a `SyntaxError` under JavaScript's `u` flag and a pattern here.
+                continue;
+            }
             if theirs != mine {
                 disagreements.push(format!(
-                    "{pattern:?} against {name:?} ({}): minimatch {theirs:?}, port {mine:?}",
-                    preset.name()
+                    "{pattern:?} against {name:?} ({}{}): minimatch {theirs:?}, port {mine:?}",
+                    preset.name(),
+                    if *partial { ", partial" } else { "" }
                 ));
             }
         }
@@ -1132,5 +1076,10 @@ fn agrees_with_minimatch_on_generated_patterns() {
         cases.len(),
         minimatch_version(&node_path),
         disagreements.join("\n")
+    );
+    assert!(
+        budgets <= cases.len() / 100,
+        "{budgets} of {} answers hit a budget of the port",
+        cases.len()
     );
 }
