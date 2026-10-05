@@ -65,6 +65,20 @@ fn timeouts() -> Timeouts {
 /// connections instead of re-handshaking per request. Every request helper here
 /// ([`fetch_with_accept`], [`post_json`]) goes through it, sharing one TLS/timeout policy that
 /// honours `--timeout` / `--no-timeout`.
+/// How every request identifies itself, to the registry and to every other host: the crate,
+/// its version and where to find it.
+pub const USER_AGENT: &str = concat!(
+    "npm-utils/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/gronke/npm-utils)"
+);
+
+/// The pause before the one retry when the server names none.
+const DEFAULT_RETRY_PAUSE: Duration = Duration::from_millis(500);
+
+/// The longest `Retry-After` honoured; a server asking for more gets the retry after this.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 fn agent() -> ureq::Agent {
@@ -85,6 +99,8 @@ fn agent_config(t: Timeouts) -> ureq::config::Config {
         )
         .timeout_connect(t.connect)
         .timeout_global(t.global)
+        // ureq's default would be `ureq/<version>`.
+        .user_agent(USER_AGENT)
         // The resolver prefetches packuments 8-wide against a single registry host
         // (`registry`'s PACKUMENT_CONCURRENCY); ureq's idle-pool defaults (3 per
         // host, 10 total) would drop and re-handshake most of those connections
@@ -109,7 +125,8 @@ fn agent_config(t: Timeouts) -> ureq::config::Config {
 /// Some hosts (GitHub in particular) occasionally drop a connection
 /// mid-transfer — observed as `io: Peer disconnected` on CI — and the same URL
 /// has not been seen to fail twice in a row, so one retry after a short pause is
-/// enough.
+/// enough. A 429 or 503 names its own pause in `Retry-After`, honoured up to 30 seconds.
+/// Every request carries [`USER_AGENT`].
 pub fn fetch(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     fetch_with_accept(url, None)
 }
@@ -133,30 +150,95 @@ pub fn fetch_with_accept(
         match try_fetch(&agent, url, accept) {
             Ok(body) => return Ok(body),
             Err(e) if attempt < attempts => {
+                let pause = e.retry_pause();
                 crate::warn::warn(&format!(
                     "download attempt {attempt}/{attempts} failed for {url}: {e}; \
-                     retrying in 500ms"
+                     retrying in {}",
+                    describe(pause)
                 ));
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(pause);
             }
-            Err(e) => return Err(e),
+            Err(FetchError::Other(e)) => return Err(e),
+            Err(status) => return Err(Box::new(status)),
         }
     }
     unreachable!()
 }
 
-fn try_fetch(
-    agent: &ureq::Agent,
-    url: &str,
-    accept: Option<&str>,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+/// Why one attempt failed; a status carries the server's `Retry-After`, when it sent one.
+#[derive(Debug)]
+enum FetchError {
+    Status {
+        code: u16,
+        retry_after: Option<Duration>,
+    },
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl FetchError {
+    /// The pause before the retry: the `Retry-After` of a 429 or 503, capped at
+    /// [`MAX_RETRY_AFTER`], else [`DEFAULT_RETRY_PAUSE`].
+    fn retry_pause(&self) -> Duration {
+        match self {
+            FetchError::Status {
+                code: 429 | 503,
+                retry_after: Some(wait),
+            } => (*wait).min(MAX_RETRY_AFTER),
+            _ => DEFAULT_RETRY_PAUSE,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Status { code, .. } => write!(f, "http status: {code}"),
+            FetchError::Other(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// `500 ms` or `3 s`, for the warning.
+fn describe(pause: Duration) -> String {
+    if pause < Duration::from_secs(1) {
+        format!("{} ms", pause.as_millis())
+    } else {
+        format!("{} s", pause.as_secs())
+    }
+}
+
+/// `Retry-After` as delta seconds; an HTTP-date reads as absent.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn try_fetch(agent: &ureq::Agent, url: &str, accept: Option<&str>) -> Result<Vec<u8>, FetchError> {
+    // A 4xx or 5xx is a response here, not an error.
+    let request = agent.get(url).config().http_status_as_error(false).build();
     let request = match accept {
-        Some(accept) => agent.get(url).header("Accept", accept),
-        None => agent.get(url),
+        Some(accept) => request.header("Accept", accept),
+        None => request,
     };
-    let mut response = request.call()?;
+    let mut response = request.call().map_err(|e| FetchError::Other(e.into()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
+        return Err(FetchError::Status {
+            code: status.as_u16(),
+            retry_after,
+        });
+    }
     let body = response.body_mut();
-    Ok(body.with_config().limit(100 * 1024 * 1024).read_to_vec()?)
+    body.with_config()
+        .limit(100 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| FetchError::Other(e.into()))
 }
 
 /// POST `body` to an `https://` URL and return the parsed JSON response, or `None` on **any**
@@ -217,6 +299,48 @@ mod tests {
         ] {
             assert!(fetch(url).is_err(), "{url:?} must be refused");
         }
+    }
+
+    #[test]
+    fn requests_identify_the_crate() {
+        assert!(USER_AGENT.starts_with(concat!("npm-utils/", env!("CARGO_PKG_VERSION"))));
+        let config = agent_config(Timeouts::default());
+        assert!(matches!(
+            config.user_agent(),
+            ureq::config::AutoHeaderValue::Provided(agent) if agent.as_str() == USER_AGENT
+        ));
+    }
+
+    #[test]
+    fn a_throttling_status_waits_for_retry_after_within_the_cap() {
+        let status = |code, retry_after| FetchError::Status { code, retry_after };
+        assert_eq!(
+            status(429, Some(Duration::from_secs(3))).retry_pause(),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            status(503, Some(Duration::from_secs(120))).retry_pause(),
+            MAX_RETRY_AFTER
+        );
+        assert_eq!(status(429, None).retry_pause(), DEFAULT_RETRY_PAUSE);
+        assert_eq!(
+            status(500, Some(Duration::from_secs(3))).retry_pause(),
+            DEFAULT_RETRY_PAUSE
+        );
+        assert_eq!(
+            FetchError::Other("peer disconnected".into()).retry_pause(),
+            DEFAULT_RETRY_PAUSE
+        );
+        assert_eq!(describe(DEFAULT_RETRY_PAUSE), "500 ms");
+        assert_eq!(describe(Duration::from_secs(3)), "3 s");
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_not_dates() {
+        assert_eq!(parse_retry_after("3"), Some(Duration::from_secs(3)));
+        assert_eq!(parse_retry_after(" 10 "), Some(Duration::from_secs(10)));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after("-1"), None);
     }
 
     #[test]
