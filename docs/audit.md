@@ -45,6 +45,12 @@ A missing/unreadable source is a hard error.
 Resolving and querying can take a while; every fetch is bounded by `--timeout` (120 s by default).
 Status output goes to stderr and never affects the report on stdout (including `--format json`) or `npm-utils:` errors, so piping stdout stays clean.
 
+## Terms
+
+npm's [Open-Source Terms](https://docs.npmjs.com/policies/open-source-terms) allow its vulnerability data "only for your own personal or internal business purposes" and forbid providing it to others "directly or as part of other products or services".
+An audit run from your machine against your project is that use.
+A service that answers third parties from npm's data would not be; such a service selects `--sources osv`, whose npm records come from the GitHub Advisory Database under CC-BY 4.0, attributed by the advisory link every finding carries.
+
 ## A worked example
 
 [`examples/audit-playground/`](../examples/audit-playground/) pins three deliberately outdated packages — its `package-lock.json` was written by `npm-utils add` itself — so one command reproduces a rich report:
