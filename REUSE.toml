@@ -1,0 +1,15 @@
+# REUSE.toml: the licence and copyright holder of every file (https://reuse.software/spec-3.3/).
+# Everything here is MIT by this project's author; a file's own header or a later table wins.
+version = 1
+
+[[annotations]]
+path = "**"
+SPDX-FileCopyrightText = "2026 Stefan Grönke <stefan@gronke.net>"
+SPDX-License-Identifier = "MIT"
+
+# The recorded advisory responses hold GitHub Advisory Database records (https://github.com/advisories),
+# licensed CC-BY 4.0 and attributed by the record links inside them; the shapes are npm's and OSV's.
+[[annotations]]
+path = ["tests/fixtures/npm-bulk-lodash.json", "tests/fixtures/osv-GHSA-jf85-cpcp-j695.json"]
+SPDX-FileCopyrightText = "GitHub, Inc. and the GitHub Advisory Database contributors"
+SPDX-License-Identifier = "CC-BY-4.0"

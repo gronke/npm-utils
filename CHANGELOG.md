@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com); releases are cut from the `[Unreleased]` section by `gronke/ci`'s `changelog` action.
 
+## [Unreleased]
+
+### Added
+
+- REUSE: every file names its licence and copyright holder through `REUSE.toml` and `LICENSES/`, checked by a `reuse lint` job; the published crate carries both.
+
 ## [0.6.2] - 2026-07-22
 
 ### Security
