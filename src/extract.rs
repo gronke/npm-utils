@@ -2,7 +2,8 @@
 //!
 //! Both [`tar_gz`] and [`zip()`] iterate an archive in memory and write selected entries beneath
 //! `dest`. `strip_prefix` (e.g. `Some("package/")` for npm tarballs) is removed from each entry
-//! path before [`Select`] is applied.
+//! path before [`Select`] is applied; `package/` is the layout every npm tarball shares, written
+//! by pacote and read by npm.
 //!
 //! Archive contents are untrusted input, so extraction is defended in layers:
 //!

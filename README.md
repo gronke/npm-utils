@@ -235,4 +235,6 @@ Anything unsupported — a dist-tag like `next`, `overrides`, lockfile v1 — fa
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE); every file's licence and copyright holder are declared through REUSE (`REUSE.toml`, `LICENSES/`).
+npm-utils is an independent project, not affiliated with or endorsed by npm, Inc. or GitHub; `npm` in its name and text refers to the registry and the tool it works with.
+What each module follows and the registry's terms it works under are listed in [docs/sources.md](docs/sources.md).

@@ -4,6 +4,9 @@
 //! registry's `dist.integrity`. [`verify`] checks the downloaded bytes against it before they
 //! are trusted, exactly as `npm install` / `npm ci` do. An integrity string with no sha512
 //! component is an error: we never install unverified.
+//!
+//! The format is W3C Subresource Integrity (<https://www.w3.org/TR/SRI/>); npm writes the
+//! `sha512-` form.
 
 use base64::Engine;
 use sha2::{Digest, Sha512};
