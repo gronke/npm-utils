@@ -110,3 +110,13 @@ jobs:
       # no committed Cargo.lock.
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --all-features
+
+  reuse:
+    name: REUSE compliance
+    runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Every file names its licence and copyright holder, by header or through REUSE.toml, and
+      # every licence named has its text under LICENSES/.
+      - uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
