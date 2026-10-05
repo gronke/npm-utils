@@ -99,7 +99,7 @@ A `Plan` freezes the listing before any output exists, so `pack .` never packs i
 `write_to_path` streams into a temporary sibling (`.<name>.<pid>.<n>.part`, created exclusively) and renames it onto the destination on success; a failed pack removes the temporary file and keeps the previous artifact.
 Every file is a `package/`-prefixed regular entry with npm's fixed mtime (1985-10-26T08:15:00Z), uid and gid zero and node-tar's portable mode (`(mode | 0600) & ~0022`, so `0644` and `0755` for the usual files, a `0600` or `0750` kept), the executable bits set for a `bin` target, gzipped at level 9; the setuid, setgid and sticky bits are masked off.
 A path beyond ustar's 255-byte split becomes a GNU longname entry.
-Each listed path is re-stat'ed without following symlinks before it is packed; the final open still races in theory, so pack trees you trust.
+Each listed path is re-stat'ed without following symlinks before it is packed, the header takes its size from the open handle, and the bytes are counted against it, so a file that shrinks or grows while it is packed fails the pack instead of misaligning the archive under digests that still verify; the final open still races against a symlink swap in theory, so pack trees you trust.
 The report is npm's object for one tarball: `id`, `name`, `version`, `size`, `unpackedSize`, `shasum` (sha1), `integrity` (sha512), `filename`, `files` with size and mode (uppercase-led paths first), `entryCount`, an empty `bundled`.
 `write` hashes and counts the bytes as they pass, `--dry-run` streams into a sink.
 The digests describe this crate's gzip stream; npm's zlib writes different bytes, installers accept both.

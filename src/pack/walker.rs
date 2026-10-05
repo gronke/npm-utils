@@ -160,17 +160,6 @@ impl Level {
         .into_iter()
         .flatten()
     }
-
-    /// ignore-walk's precedence: an allowlist silences both ignore files, a `.npmignore` silences
-    /// the `.gitignore` beside it.
-    fn silence(&mut self) {
-        if self.allowlist.is_some() {
-            self.npmignore = None;
-            self.gitignore = None;
-        } else if self.npmignore.is_some() {
-            self.gitignore = None;
-        }
-    }
 }
 
 fn rules<S: AsRef<str>>(lines: impl IntoIterator<Item = S>, quirks: bool) -> Result<Vec<Rule>> {
@@ -184,7 +173,16 @@ fn rules<S: AsRef<str>>(lines: impl IntoIterator<Item = S>, quirks: bool) -> Res
 /// The rules of `dir/<name>` when that ignore file exists.
 fn ignore_file(dir: &Path, name: &str, quirks: bool) -> Result<Option<Vec<Rule>>> {
     let path = dir.join(name);
-    if !path.is_file() {
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Ok(None);
+    };
+    // A symlinked ignore file is refused, never read, in both modes: its rules would come from
+    // outside the tree, and a strict refusal quotes the rule at fault, which would print a line
+    // of whatever the link points at.
+    if meta.file_type().is_symlink() {
+        return Err(format!("{}: an ignore file must not be a symlink", path.display()).into());
+    }
+    if !meta.is_file() {
         return Ok(None);
     }
     let text =

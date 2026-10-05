@@ -12,7 +12,7 @@ mod walker;
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::path::Path;
 
@@ -158,20 +158,30 @@ impl Plan {
             let meta = checked_meta(&full)?;
             let mode = mode_fix(unix_mode(&meta), self.bins.contains(path));
             let mut header = tar::Header::new_ustar();
-            header.set_size(meta.len());
             header.set_mode(mode);
             header.set_mtime(MTIME);
             header.set_uid(0);
             header.set_gid(0);
             header.set_entry_type(tar::EntryType::Regular);
-            let file = File::open(&full).map_err(|e| format!("{}: {e}", full.display()))?;
-            builder
-                .append_data(&mut header, format!("package/{path}"), file)
-                .map_err(|e| format!("packing {path}: {e}"))?;
-            unpacked_size += meta.len();
+            let mut file = File::open(&full).map_err(|e| format!("{}: {e}", full.display()))?;
+            // The size comes from the open handle, and the bytes are counted against it, so a
+            // file that changes size while it is packed is an error, never a misaligned archive.
+            let size = file
+                .metadata()
+                .map_err(|e| format!("{}: {e}", full.display()))?
+                .len();
+            append_exact(
+                &mut builder,
+                &mut header,
+                &format!("package/{path}"),
+                &mut file,
+                size,
+                path,
+            )?;
+            unpacked_size += size;
             files.push(Entry {
                 path: path.clone(),
-                size: meta.len(),
+                size,
                 mode,
             });
         }
@@ -337,6 +347,8 @@ impl Packed {
 
 /// The manifest, which must carry a `name` and a `version` to pack; both pass the crate's
 /// path-safety allowlists first, since they become the tarball's filename.
+/// A symlinked `package.json` is read through the link; only regular files ship, so the link
+/// does not.
 fn manifest(dir: &Path) -> Result<Value> {
     let path = dir.join("package.json");
     let text =
@@ -393,7 +405,7 @@ fn unix_mode(_meta: &std::fs::Metadata) -> u32 {
 
 /// The metadata of a listed file, re-checked without following symlinks: a path that stopped
 /// being a regular file since the walk fails the pack instead of shipping its target. The
-/// `File::open` after this still races in theory; std has no `O_NOFOLLOW` without libc.
+/// `File::open` after this still races a symlink swap.
 fn checked_meta(full: &Path) -> Result<std::fs::Metadata> {
     let meta = std::fs::symlink_metadata(full).map_err(|e| format!("{}: {e}", full.display()))?;
     if !meta.is_file() {
@@ -404,6 +416,61 @@ fn checked_meta(full: &Path) -> Result<std::fs::Metadata> {
         .into());
     }
     Ok(meta)
+}
+
+/// Append `data` as `name` with a header of exactly `size` bytes. tar pads by what it copied,
+/// so a source that ends early would misalign the archive, and one that goes on would leave its
+/// extra bytes where the next header is read, both under digests that still verify; either is
+/// an error naming the file.
+fn append_exact<W: Write, R: Read>(
+    builder: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    name: &str,
+    data: &mut R,
+    size: u64,
+    path: &str,
+) -> Result<()> {
+    header.set_size(size);
+    let exactly = Exactly {
+        inner: &mut *data,
+        left: size,
+        path,
+    };
+    builder
+        .append_data(header, name, exactly)
+        .map_err(|e| format!("packing {path}: {e}"))?;
+    let mut probe = [0u8; 1];
+    if data.read(&mut probe).map_err(|e| format!("{path}: {e}"))? > 0 {
+        return Err(format!("{path}: grew while packing").into());
+    }
+    Ok(())
+}
+
+/// Exactly `left` bytes of `inner`: the end of the source before that is an error.
+struct Exactly<'a, R: Read> {
+    inner: &'a mut R,
+    left: u64,
+    path: &'a str,
+}
+
+impl<R: Read> Read for Exactly<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::Error::other(format!(
+                "{}: shrank while packing",
+                self.path
+            )));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
 }
 
 /// node-tar's portable mode fix, `(mode | 0o600) & !0o022` within the permission bits (`0644`
@@ -474,6 +541,36 @@ fn case_order(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_exact_refuses_a_source_that_shrank_or_grew() {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Regular);
+        let mut short = io::Cursor::new(b"abc".to_vec());
+        let mut builder = tar::Builder::new(Vec::new());
+        let error = append_exact(&mut builder, &mut header, "package/x", &mut short, 5, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("shrank while packing"), "{error}");
+        let mut long = io::Cursor::new(b"abcdef".to_vec());
+        let mut builder = tar::Builder::new(Vec::new());
+        let error = append_exact(&mut builder, &mut header, "package/x", &mut long, 5, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("grew while packing"), "{error}");
+        let mut exact = io::Cursor::new(b"abcde".to_vec());
+        let mut builder = tar::Builder::new(Vec::new());
+        append_exact(&mut builder, &mut header, "package/x", &mut exact, 5, "x").unwrap();
+        let bytes = builder.into_inner().unwrap();
+        // The archive reads back aligned: one entry of five bytes.
+        let mut archive = tar::Archive::new(io::Cursor::new(bytes));
+        let sizes: Vec<u64> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().header().size().unwrap())
+            .collect();
+        assert_eq!(sizes, vec![5]);
+    }
     use std::fs;
 
     fn package(files: &[(&str, &str)], manifest: &str) -> tempfile::TempDir {

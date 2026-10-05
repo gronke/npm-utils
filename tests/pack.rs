@@ -645,6 +645,46 @@ fn node_modules_never_ships_at_any_depth() {
 }
 
 #[test]
+#[cfg(unix)]
+fn a_symlinked_ignore_file_is_refused_without_quoting_its_target() {
+    use std::os::unix::fs::symlink;
+    // Its rules would come from outside the tree, and a strict refusal quotes the rule at
+    // fault: a planted link to a shell history would print a line of it. The refusal names the
+    // path only, at the root and below, in both modes.
+    for name in [".npmignore", ".gitignore"] {
+        let outer = tempfile::tempdir().unwrap();
+        let pkg = outer.path().join("pkg");
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "x").unwrap();
+        std::fs::write(pkg.join("lib/a.js"), "x").unwrap();
+        std::fs::write(outer.path().join("history"), "echo [SECRET_HISTORY_LINE\n").unwrap();
+        for dir in [pkg.clone(), pkg.join("lib")] {
+            let link = dir.join(name);
+            symlink(outer.path().join("history"), &link).unwrap();
+            for settings in [pack::Settings::default(), pack::Settings { quirks: true }] {
+                let error = pack::list_with(&pkg, &settings).unwrap_err().to_string();
+                assert!(error.contains("must not be a symlink"), "{name}: {error}");
+                assert!(error.contains(name), "{name}: {error}");
+                assert!(!error.contains("SECRET_HISTORY_LINE"), "{name}: {error}");
+            }
+            std::fs::remove_file(&link).unwrap();
+        }
+        // The same file in place is read as rules.
+        std::fs::write(pkg.join(name), "lib\n").unwrap();
+        let listed = pack::list(&pkg).unwrap();
+        assert!(
+            !listed.iter().any(|f| f.starts_with("lib/")),
+            "{name}: {listed:?}"
+        );
+    }
+}
+
+#[test]
 fn main_cannot_ship_a_root_npm_extension() {
     let dir = package(
         &[
