@@ -24,7 +24,8 @@ The two recorded fixtures under `tests/fixtures/` are advisory responses: their 
 
 npm's [Open-Source Terms](https://docs.npmjs.com/policies/open-source-terms) allow searching, downloading and managing packages "using software other than CLI via application programming interfaces that npm publicly documents or makes available for public use".
 npm-utils uses four such APIs and nothing on the website: `GET /<name>` for the packument, by default the abbreviated install document (`Accept: application/vnd.npm.install-v1+json`), the tarball URL a packument advertises, `GET /-/v1/search` with `size` at most 250, and `POST /-/npm/v1/security/advisories/bulk`, the npm CLI's own audit endpoint.
-The load stays small: the resolver fetches at most eight packuments at a time, tarballs download one after another, and a failed request is retried once.
+The load stays small: the resolver fetches at most eight packuments at a time, tarballs download one after another, and a failed request is retried once, after the `Retry-After` a 429 or 503 names (capped at 30 seconds) or half a second.
+Every request identifies itself as `npm-utils/<version> (https://github.com/gronke/npm-utils)`.
 The [crawler policy](https://docs.npmjs.com/policies/crawlers) concerns the website and names downloading tarballs for inspection as acceptable; a mirror or proxy is pointed at through the registry URL, never crawled.
 
 Vulnerability data from npm may be used "only for your own personal or internal business purposes", and the terms forbid providing it to others "directly or as part of other products or services".

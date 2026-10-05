@@ -1,5 +1,8 @@
 //! npm's native bulk-advisory source.
 //!
+//! npm's terms allow this data for your own use only; docs/audit.md says where that leaves a
+//! service built on the crate.
+//!
 //! npm's legacy `audits` / `audits/quick` endpoints are retired (they answer `410`); the live
 //! contract is a single `POST` of a gzipped `{ "<name>": ["<version>", …] }` map to
 //! `/-/npm/v1/security/advisories/bulk`. The response is keyed by package name; each advisory
