@@ -12,8 +12,10 @@
 //! component carries are exactly what the lockfile records (npm writes both per package, and so
 //! does this crate's [`crate::package_json::lock::render_v3`]).
 //!
-//! [CycloneDX]: https://cyclonedx.org
-//! [SPDX]: https://spdx.dev
+//! Package URLs follow the purl specification (<https://github.com/package-url/purl-spec>).
+//!
+//! [CycloneDX]: https://cyclonedx.org/docs/1.6/json/
+//! [SPDX]: https://spdx.github.io/spdx-spec/v2.3/
 //!
 //! ```no_run
 //! use npm_utils::{package_json::lock::Lockfile, sbom};

@@ -1,5 +1,10 @@
 //! npm registry interaction: tarball URLs, package metadata, and version
 //! resolution against a semver range.
+//!
+//! The endpoints are the registry API as the npm CLI uses it: the packument, by default in its
+//! abbreviated install form, the tarball URL it advertises, and `/-/v1/search`. npm's public
+//! description of the packument and of the abbreviated document is archived at
+//! <https://github.com/npm/registry>.
 
 use crate::download;
 use crate::package_json::spec::{Range, Spec};

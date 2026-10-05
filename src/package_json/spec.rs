@@ -6,6 +6,9 @@
 //! registry tarball — the only form `npm-utils` installs (git / remote-tarball / local-path /
 //! alias-to-non-registry are not). Range *parsing* is deferred to [`version_req`]: classifying
 //! never fails, so an npm range we can't fully parse (spaces, `||`) is still a registry spec.
+//!
+//! Ranges follow node-semver's grammar (<https://github.com/npm/node-semver#ranges>), parsed
+//! onto the `semver` crate by [`Range`] and [`version_req`].
 
 use semver::{Version, VersionReq};
 

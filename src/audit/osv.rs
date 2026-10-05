@@ -8,6 +8,9 @@
 //! is only relevant when one of its `affected` entries is the npm package we asked about; that
 //! entry's SEMVER `events` are turned into a `>=`/`<` range string the shared
 //! [`Range`] matcher can post-filter.
+//!
+//! The API is documented at <https://google.github.io/osv.dev/api/>, the databases OSV aggregates
+//! and their licences at <https://google.github.io/osv.dev/data/>.
 
 use std::collections::HashMap;
 
