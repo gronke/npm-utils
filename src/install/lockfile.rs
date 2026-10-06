@@ -369,15 +369,15 @@ mod tests {
         // A scoped member (bare repo-relative target) and an unscoped one with a
         // `file:` prefix — both inside the project.
         let pkgs = [
-            locked_link("node_modules/@schuhkarton/assets-web", "modules/assets/web"),
+            locked_link("node_modules/@acme/assets-web", "modules/assets/web"),
             locked_link("node_modules/plain", "file:packages/plain"),
         ];
         let links: Vec<&LockedPackage> = pkgs.iter().collect();
         link_locals(dest, &links).unwrap();
 
-        // Scoped: two segments above dest (`node_modules/@schuhkarton/`) ⇒ `../../`.
+        // Scoped: two segments above dest (`node_modules/@acme/`) ⇒ `../../`.
         assert_eq!(
-            std::fs::read_link(dest.join("node_modules/@schuhkarton/assets-web")).unwrap(),
+            std::fs::read_link(dest.join("node_modules/@acme/assets-web")).unwrap(),
             Path::new("../../modules/assets/web")
         );
         // Unscoped: one segment above dest ⇒ `../`, and the `file:` prefix is stripped.
