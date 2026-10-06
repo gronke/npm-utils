@@ -1,0 +1,8 @@
+{
+  "name": "sealed-node",
+  "private": true,
+  "description": "The minimatch the live matcher tests compare against (tests/minimatch.rs), installed by the pinned npm into the sealed container's NODE_PATH.",
+  "dependencies": {
+    "minimatch": "10.2.5"
+  }
+}

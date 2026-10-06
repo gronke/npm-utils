@@ -9,22 +9,89 @@
 //! - **Entry-type allowlist** — only regular files and directories are written; symlinks,
 //!   hardlinks, device nodes, FIFOs and sockets are skipped, so an archive can't plant a link or
 //!   special file.
-//! - **Structural path check** ([`crate::path_safety::safe_join`]) — reject `..`, absolute,
-//!   root/drive, and backslash segments before touching the filesystem.
+//! - **Structural path check** ([`crate::path_safety::ensure_within`]) — the entry name as the
+//!   archive wrote it is validated before any selection maps it: `..`, absolute, root/drive,
+//!   backslash, NUL, interior `.` and empty segments are errors in every mode, never
+//!   relativized or cleaned. The selected destination passes the same check again
+//!   ([`crate::path_safety::safe_join`]).
 //! - **Symlink-resolved containment** ([`crate::path_safety::contained_target`]) — each write's
-//!   parent is canonicalized and required to stay within the canonicalized `dest`, so even a
-//!   symlink already on disk (pre-existing, or from a destination shared across calls) can't
-//!   redirect a write outside it.
-//! - **Size cap** — entries are streamed (never buffered whole) and the total is bounded, so a
-//!   decompression bomb can't exhaust memory or disk.
+//!   parent is canonicalized and required to stay within the canonicalized `dest`, before any
+//!   directory is created beneath it, so even a symlink already on disk (pre-existing, or from a
+//!   destination shared across calls) can't redirect a write outside it.
+//! - **Exclusive creation** ([`crate::path_safety::create_contained_file`]) — a file is created
+//!   `create_new`; a regular file already there is unlinked rather than written through, and a
+//!   directory, FIFO, device or socket there is refused by name instead of followed or blocked on.
+//! - **Size caps** — entries are streamed (never buffered whole), the bytes written are bounded,
+//!   and so is the inflated stream itself, header bodies and skipped entries included, so a
+//!   decompression bomb can't exhaust memory or disk whichever part of the archive carries it.
+//!
+//! Limits:
+//!
+//! - The containment check and the open are two steps; `create_new` closes the window for the
+//!   file itself, and a directory swapped for a symlink in between redirects a later write.
+//! - On a case-insensitive filesystem two entries differing only in case land on one file; the
+//!   last one wins.
+//! - The gzip reader takes one member; bytes after it are ignored.
+//! - Contiguous (type `7`) tar entries are skipped.
 
 use flate2::read::GzDecoder;
-use std::fs::{create_dir_all, File};
-use std::io::{Cursor, Read, Write};
+use std::fs::create_dir_all;
+use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 use tar::Archive;
 
-use crate::path_safety::{contained_target, safe_join};
+use crate::path_safety::{contained_target, create_contained_file, ensure_within, safe_join};
+
+/// The ceilings one extraction may not cross.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// Bytes one archive may write to disk.
+    pub total_bytes: u64,
+    /// Entries one archive may hold, counted before the type filter.
+    pub entries: u64,
+    /// Bytes the decompressor may produce for one archive: the files, the entries a selection
+    /// skips and the extension headers tar reads whole, which no other cap sees.
+    pub inflated_bytes: u64,
+}
+
+impl Limits {
+    pub(crate) const DEFAULT: Limits = Limits {
+        total_bytes: MAX_TOTAL_BYTES,
+        entries: MAX_ENTRIES,
+        inflated_bytes: MAX_TOTAL_BYTES + 256 * 1024 * 1024,
+    };
+}
+
+/// A reader that ends with an error once `left` bytes have passed and more follow: the inflated
+/// stream's cap, applied beneath the archive reader so every byte it pulls is counted.
+struct Capped<R: Read> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            // One probe byte tells an archive that ends exactly at the cap from one that goes on.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::other(
+                    "archive inflates past the extraction size limit (possible decompression bomb)",
+                )),
+            };
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
 
 /// Which archive entries to extract, and where each lands (relative to `dest`).
 pub enum Select<'a> {
@@ -61,7 +128,20 @@ pub fn tar_gz(
     strip_prefix: Option<&str>,
     select: Select<'_>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let mut archive = Archive::new(GzDecoder::new(Cursor::new(bytes)));
+    tar_gz_with(bytes, dest, strip_prefix, select, &Limits::DEFAULT)
+}
+
+pub(crate) fn tar_gz_with(
+    bytes: &[u8],
+    dest: &Path,
+    strip_prefix: Option<&str>,
+    select: Select<'_>,
+    limits: &Limits,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut archive = Archive::new(Capped {
+        inner: GzDecoder::new(Cursor::new(bytes)),
+        left: limits.inflated_bytes,
+    });
     let mut count = 0;
     let mut total: u64 = 0;
     let mut entries: u64 = 0;
@@ -71,8 +151,8 @@ pub fn tar_gz(
     for entry in archive.entries()? {
         let mut entry = entry?;
         entries += 1;
-        if entries > MAX_ENTRIES {
-            return Err(too_many_entries());
+        if entries > limits.entries {
+            return Err(too_many_entries(limits.entries));
         }
         let entry_type = entry.header().entry_type();
         let is_dir = entry_type.is_dir();
@@ -97,6 +177,9 @@ pub fn tar_gz(
         if is_root_entry(rel) {
             continue;
         }
+        // The name as the archive wrote it must already be a contained relative path, before
+        // any selection maps it: a `../x` or `/etc/passwd` is an error, never relativized.
+        ensure_within(rel)?;
         if is_dir {
             if matches!(select, Select::All) {
                 // Create the directory through the same symlink-resolved containment guard the file
@@ -110,9 +193,12 @@ pub fn tar_gz(
             continue;
         };
         let out = safe_join(dest, &dest_rel)?;
-        let target = contained_target(&root, &out)?;
-        let mut file = File::create(&target)?;
-        total += copy_capped(&mut entry, &mut file, MAX_TOTAL_BYTES.saturating_sub(total))?;
+        let mut file = create_contained_file(&root, &out)?;
+        total += copy_capped(
+            &mut entry,
+            &mut file,
+            limits.total_bytes.saturating_sub(total),
+        )?;
         count += 1;
     }
     Ok(count)
@@ -125,9 +211,19 @@ pub fn zip(
     strip_prefix: Option<&str>,
     select: Select<'_>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    zip_with(bytes, dest, strip_prefix, select, &Limits::DEFAULT)
+}
+
+pub(crate) fn zip_with(
+    bytes: &[u8],
+    dest: &Path,
+    strip_prefix: Option<&str>,
+    select: Select<'_>,
+    limits: &Limits,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-    if archive.len() as u64 > MAX_ENTRIES {
-        return Err(too_many_entries());
+    if archive.len() as u64 > limits.entries {
+        return Err(too_many_entries(limits.entries));
     }
     let mut count = 0;
     let mut total: u64 = 0;
@@ -139,28 +235,25 @@ pub fn zip(
         if file.is_dir() || file.is_symlink() {
             continue;
         }
-        let name = match file.enclosed_name() {
-            Some(n) => match n.to_str() {
-                Some(s) => s.to_owned(),
-                None => return Err(non_utf8_entry(&n)),
-            },
-            None => return Err("unsafe zip entry name (escapes destination)".into()),
-        };
+        // The name as written, not the zip crate's cleaned `enclosed_name`, which drops a
+        // leading `/` or drive, resolves `a/../b` and reads `\` as a separator: each of those
+        // is an error here, as it is for a tarball.
+        let name = file.name().to_owned();
         let rel = strip(&name, strip_prefix);
         // Skip the archive root itself (`.`/empty), as in `tar_gz`.
         if is_root_entry(rel) {
             continue;
         }
+        ensure_within(rel)?;
         let Some(dest_rel) = select.dest_for(rel) else {
             continue;
         };
         let out = safe_join(dest, &dest_rel)?;
-        let target = contained_target(&root, &out)?;
-        let mut writer = File::create(&target)?;
+        let mut writer = create_contained_file(&root, &out)?;
         total += copy_capped(
             &mut file,
             &mut writer,
-            MAX_TOTAL_BYTES.saturating_sub(total),
+            limits.total_bytes.saturating_sub(total),
         )?;
         count += 1;
     }
@@ -192,8 +285,8 @@ const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 /// any real single package, which has at most a few thousand files.
 const MAX_ENTRIES: u64 = 200_000;
 
-fn too_many_entries() -> Box<dyn std::error::Error + Send + Sync> {
-    format!("archive has more than {MAX_ENTRIES} entries (possible archive bomb)").into()
+fn too_many_entries(limit: u64) -> Box<dyn std::error::Error + Send + Sync> {
+    format!("archive has more than {limit} entries (possible archive bomb)").into()
 }
 
 /// Reject an archive entry whose path is not valid UTF-8, rather than lossily mangling it.
@@ -507,6 +600,218 @@ mod tests {
         // Over budget (the decompression-bomb case): errors rather than truncating silently.
         let mut overflow = Vec::new();
         assert!(copy_capped(&mut src.as_slice(), &mut overflow, 100).is_err());
+    }
+
+    /// A `.tar.gz` with one regular file whose header carries `raw_name` verbatim, bypassing
+    /// `Header::set_path`, which refuses the names an attacker writes by hand.
+    fn make_tar_gz_raw_name(raw_name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.as_old_mut().name[..raw_name.len()].copy_from_slice(raw_name.as_bytes());
+        header.set_cksum();
+        builder.append(&header, IoCursor::new(contents)).unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A `.tar.gz` whose first entry is a GNU long-name header with `size` bytes of `body`, the
+    /// kind tar reads whole before any file is seen, followed by the file it names.
+    fn make_tar_gz_with_long_name_body(size: u64, body: impl Read) -> Vec<u8> {
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.as_old_mut().name[..13].copy_from_slice(b"././@LongLink");
+        header.set_cksum();
+        builder.append(&header, body).unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_size(1);
+        file.set_mode(0o644);
+        file.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut file, "package/x.js", IoCursor::new(&b"x"[..]))
+            .unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(IoCursor::new(Vec::new()));
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn nothing_but(dir: &Path, allowed: &[&str]) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .all(|e| allowed.contains(&e.unwrap().file_name().to_str().unwrap()))
+    }
+
+    #[test]
+    fn an_oversized_extension_header_is_an_error_not_an_allocation() {
+        // tar reads a GNU long-name or PAX body whole before the entry it describes exists, so
+        // no per-file cap sees it; the inflated-stream cap beneath the reader does.
+        let tmp = tempdir().unwrap();
+        let bomb = make_tar_gz_with_long_name_body(
+            8 * 1024 * 1024,
+            std::io::repeat(b'x').take(8 * 1024 * 1024),
+        );
+        let limits = Limits {
+            inflated_bytes: 1024 * 1024,
+            ..Limits::DEFAULT
+        };
+        let error = tar_gz_with(&bomb, tmp.path(), Some("package/"), Select::All, &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inflates past"), "{error}");
+        // A long name of ordinary length, within the cap, is read and names the file.
+        let name = format!("package/{}", "x".repeat(150));
+        let long = make_tar_gz_with_long_name_body(name.len() as u64, IoCursor::new(name.clone()));
+        let written =
+            tar_gz_with(&long, tmp.path(), Some("package/"), Select::All, &limits).unwrap();
+        assert_eq!(written, 1);
+        assert!(tmp.path().join(&name["package/".len()..]).is_file());
+    }
+
+    #[test]
+    fn too_many_entries_is_an_error() {
+        let tmp = tempdir().unwrap();
+        let tgz = make_tar_gz(&[
+            ("package/a", b"a"),
+            ("package/b", b"b"),
+            ("package/c", b"c"),
+        ]);
+        let limits = Limits {
+            entries: 2,
+            ..Limits::DEFAULT
+        };
+        let error = tar_gz_with(&tgz, tmp.path(), Some("package/"), Select::All, &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more than 2 entries"), "{error}");
+    }
+
+    #[test]
+    fn rejects_parent_and_absolute_entry_names_before_selection() {
+        // The name as written is validated before a selection maps it, so an install's
+        // top-directory strip never turns `../x` into `x` or `/etc/passwd` into `etc/passwd`.
+        let strip_top =
+            |rel: &str| -> Option<String> { rel.split_once('/').map(|(_, rest)| rest.to_string()) };
+        for raw in [
+            "../evil.js",
+            "/etc/passwd",
+            "package/../evil.js",
+            "package/./x",
+        ] {
+            let tmp = tempdir().unwrap();
+            let dest = tmp.path().join("dest");
+            let tgz = make_tar_gz_raw_name(raw, b"owned");
+            for select in [Select::All, Select::Matching(&strip_top)] {
+                let error = tar_gz(&tgz, &dest, None, select).unwrap_err().to_string();
+                assert!(error.contains("refuses to escape"), "{raw}: {error}");
+            }
+            assert!(nothing_but(&dest, &[]), "{raw} wrote something");
+            assert!(
+                nothing_but(tmp.path(), &["dest"]),
+                "{raw} wrote outside dest"
+            );
+        }
+    }
+
+    #[test]
+    fn zip_extracts_a_benign_archive() {
+        let tmp = tempdir().unwrap();
+        let archive = make_zip(&[("package/a.txt", b"A"), ("package/dir/b.txt", b"B")]);
+        let written = zip(&archive, tmp.path(), Some("package/"), Select::All).unwrap();
+        assert_eq!(written, 2);
+        assert_eq!(std::fs::read(tmp.path().join("a.txt")).unwrap(), b"A");
+        assert_eq!(std::fs::read(tmp.path().join("dir/b.txt")).unwrap(), b"B");
+    }
+
+    #[test]
+    fn zip_rejects_parent_absolute_and_backslash_names() {
+        // zip's own `enclosed_name` would clean these into contained paths; the name as written
+        // is an error here, as it is for a tarball.
+        for raw in ["../evil", "/abs", "a\\..\\b", "dir/../x", "a/./b"] {
+            let tmp = tempdir().unwrap();
+            let dest = tmp.path().join("dest");
+            let archive = make_zip(&[(raw, b"owned")]);
+            let result = zip(&archive, &dest, None, Select::All);
+            assert!(result.is_err(), "{raw} was accepted");
+            assert!(nothing_but(&dest, &[]), "{raw} wrote something");
+            assert!(
+                nothing_but(tmp.path(), &["dest"]),
+                "{raw} wrote outside dest"
+            );
+        }
+    }
+
+    #[test]
+    fn zip_skips_symlink_and_directory_entries_and_keeps_case_variants() {
+        let tmp = tempdir().unwrap();
+        let mut writer = zip::ZipWriter::new(IoCursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.add_directory("dir", options).unwrap();
+        writer.add_symlink("link", "/etc/passwd", options).unwrap();
+        writer.start_file("a.txt", options).unwrap();
+        writer.write_all(b"lower").unwrap();
+        writer.start_file("A.txt", options).unwrap();
+        writer.write_all(b"upper").unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let written = zip(&archive, tmp.path(), None, Select::All).unwrap();
+        assert_eq!(written, 2, "the two files, not the link or the directory");
+        assert!(std::fs::symlink_metadata(tmp.path().join("link")).is_err());
+        assert!(!tmp.path().join("dir").exists());
+        // Case variants are distinct entries; on a case-insensitive filesystem the second write
+        // replaces the first, never escapes.
+        assert!(tmp.path().join("a.txt").is_file());
+    }
+
+    #[test]
+    fn zip_caps_the_total_bytes() {
+        let tmp = tempdir().unwrap();
+        let archive = make_zip(&[("a", &[0u8; 1024]), ("b", &[0u8; 1024])]);
+        let limits = Limits {
+            total_bytes: 1500,
+            ..Limits::DEFAULT
+        };
+        let error = zip_with(&archive, tmp.path(), None, Select::All, &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("extraction size limit"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_fifo_at_the_destination_is_refused_not_blocked_on() {
+        // An ordinary `File::create` on a FIFO blocks until a reader appears; the extraction
+        // refuses instead, which this test proves by finishing.
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dest.join("x.js"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("mkfifo unavailable; skipped");
+            return;
+        }
+        let tgz = make_tar_gz(&[("package/x.js", b"owned")]);
+        let error = tar_gz(&tgz, &dest, Some("package/"), Select::All)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refuses to write over it"), "{error}");
     }
 
     #[test]

@@ -86,6 +86,70 @@ jobs:
       - name: Build on MSRV
         run: cargo +1.88 build -p npm-utils --all-features
 
+  # The port against the world: npm 12.1.0 (the version tests/fixtures/pack/npm.json pins)
+  # and minimatch 10.2.5 answer live through ci/sealed-node, a digest-pinned node container
+  # without network, so the recorders, the generated differential and the real-package corpora
+  # (tests/pack_e2e.rs) run here on every pull request, and the committed records must
+  # reproduce; the minimatch tree itself is installed by this crate's `ci` verb.
+  pack-e2e:
+    name: pack · real packages against npm 12.1.0
+    runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      NODE_IMAGE: node:24-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+      NPM_VERSION: 12.1.0
+      NPM_INTEGRITY: sha512-Fyhu62pNx70YCs/5+dEmJQTFVmSKwvo5CA0qvBkGDRpob42MJ6G2RQ2tdxeKM4nYnIZDqkYAxEgqtoejn9QGtQ==
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.1.0
+        with:
+          toolchain: stable
+
+      - uses: gronke/rust-ci/.github/actions/rust-cache@v1.1.0
+        with:
+          prefix: pack-e2e
+
+      # The image bundles npm 11; the pinned npm rides in as an integrity-checked tarball and
+      # runs from its own tree (it bundles its dependencies).
+      - name: npm ${{ env.NPM_VERSION }}, integrity-checked
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://registry.npmjs.org/npm/-/npm-${NPM_VERSION}.tgz" -o "$RUNNER_TEMP/npm.tgz"
+          got="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP/npm.tgz" | base64 -w0)"
+          [ "$got" = "$NPM_INTEGRITY" ] || { echo "::error::npm tarball integrity mismatch: $got"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/npm" && tar -xzf "$RUNNER_TEMP/npm.tgz" -C "$RUNNER_TEMP/npm" --strip-components=1
+          echo "SEALED_NPM=$RUNNER_TEMP/npm" >> "$GITHUB_ENV"
+
+      # The minimatch the live matcher tests compare against, installed from the committed
+      # lockfile by this crate's own `ci` verb: lockfile v3, every tarball sha512-checked, no
+      # scripts. No container run needs the network after this.
+      - name: minimatch 10.2.5 from the lockfile, through npm-utils ci
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sealed-node"
+          cp ci/sealed-node/package.json ci/sealed-node/package-lock.json "$RUNNER_TEMP/sealed-node/"
+          cargo run --features cli --bin npm-utils -- ci "$RUNNER_TEMP/sealed-node"
+          echo "SEALED_NODE_MODULES=$RUNNER_TEMP/sealed-node/node_modules" >> "$GITHUB_ENV"
+          echo "MINIMATCH_NODE_PATH=$RUNNER_TEMP/sealed-node/node_modules" >> "$GITHUB_ENV"
+          echo "$PWD/ci/sealed-node/bin" >> "$GITHUB_PATH"
+
+      - name: The live tests and the real-package corpora
+        run: cargo test --features cli --bin npm-utils --test pack_npm --test cli --test minimatch --test pack_e2e -- --ignored --test-threads=1
+
+      # The recorders rewrote the records from npm 12.1.0 and minimatch 10.2.5; the committed
+      # ones must come back unchanged.
+      - name: The pinned records reproduce
+        run: git diff --exit-code -- tests/fixtures
+
+      # The property tests at depth: the checks matrix runs 256 cases per property, this run 4096.
+      - name: The property tests, 4096 cases per property
+        run: cargo test --test minimatch_props
+        env:
+          PROPTEST_CASES: "4096"
+
   package:
     name: publish dry-run
     runs-on: ${{ vars.RUNNER_STANDARD || 'ubuntu-latest' }}

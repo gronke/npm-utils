@@ -1,7 +1,7 @@
 //! `from_lockfile()` — install the exact tree pinned by a `package-lock.json` (pure-Rust
 //! `npm ci`), plus `node_modules/.bin/` shims.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::package_json::lock::{LockedPackage, Lockfile};
 use semver::Version;
@@ -271,7 +271,13 @@ fn link_locals(
         // Relative, relocatable link value: climb from the link's parent back
         // to `dest` (one `..` per key segment above the leaf), then descend
         // into the target. e.g. `node_modules/@s/x → modules/x` ⇒ `../../modules/x`.
-        let depth = pkg.key.split('/').filter(|s| !s.is_empty()).count() - 1;
+        // The climb is counted on the components the path is written with,
+        // so a key spelled `./node_modules/x` climbs one level, not two.
+        let depth = Path::new(&pkg.key)
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count()
+            .saturating_sub(1);
         let link_value = format!("{}{target}", "../".repeat(depth));
 
         if let Some(parent) = link_abs.parent() {
@@ -402,6 +408,40 @@ mod tests {
                 && std::fs::symlink_metadata(dest.join("node_modules/outside")).is_err(),
             "an escaping link target creates nothing"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_locals_counts_the_climb_on_the_written_components() {
+        // A key spelled `./node_modules/x` lands at `node_modules/x`; a climb counted on the
+        // raw segments would be one level too many and point the link out of the project.
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path();
+        std::fs::create_dir_all(dest.join("pkgs/x")).unwrap();
+        let pkgs = [locked_link("./node_modules/x", "pkgs/x")];
+        let links: Vec<&LockedPackage> = pkgs.iter().collect();
+        link_locals(dest, &links).unwrap();
+        let link = dest.join("node_modules/x");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("../pkgs/x")
+        );
+        assert_eq!(
+            link.canonicalize().unwrap(),
+            dest.join("pkgs/x").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_locals_refuses_a_key_with_an_interior_dot_segment() {
+        // `node_modules/./x` is no key npm writes; the structural check refuses it before any
+        // climb is counted.
+        let tmp = tempdir().unwrap();
+        let pkgs = [locked_link("node_modules/./x", "pkgs/x")];
+        let links: Vec<&LockedPackage> = pkgs.iter().collect();
+        assert!(link_locals(tmp.path(), &links).is_err());
+        assert!(std::fs::symlink_metadata(tmp.path().join("node_modules/x")).is_err());
     }
 
     #[test]

@@ -14,10 +14,23 @@
 
 use std::process::Command;
 
-/// The CLI binary. Cargo sets `CARGO_BIN_EXE_npm-utils` because the bin's `required-features`
-/// (`cli`) are active for this test build.
+/// The CLI binary. Cargo sets `CARGO_BIN_EXE_npm-utils` while it compiles this test when the
+/// bin is part of the same build (its `required-features`, `cli`, are active); when the test is
+/// built on its own, the bin still lands beside the test executables, so the path is derived
+/// from this executable's: `target/<profile>/deps/cli-<hash>` to `target/<profile>/npm-utils`.
 fn npm_utils() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_npm-utils"))
+    let path = match option_env!("CARGO_BIN_EXE_npm-utils") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let test = std::env::current_exe().expect("the test executable's path");
+            let profile = test
+                .parent()
+                .and_then(|deps| deps.parent())
+                .expect("target/<profile>/deps/<test>");
+            profile.join(format!("npm-utils{}", std::env::consts::EXE_SUFFIX))
+        }
+    };
+    Command::new(path)
 }
 
 fn run(cmd: &mut Command, what: &str) -> String {
@@ -240,4 +253,455 @@ fn lockfile_only_install_shows_a_resolve_task_offline() {
     assert!(stderr.contains("0 packages ("), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("wrote "));
     assert!(project.path().join("package-lock.json").is_file());
+}
+
+/// A package directory for the `pack` tests: an allowlist, a silenced `.npmignore`, the files
+/// npm always ships and never ships, a `bin`, and a nested directory.
+fn pack_fixture(root: &std::path::Path) {
+    let write = |path: &str, content: &str| {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+    };
+    write(
+        "package.json",
+        r#"{"name":"@acme/demo","version":"1.2.3","files":["dist","LICENSE-MIT"],
+            "main":"dist/index.js","bin":{"demo":"bin/demo.js"}}"#,
+    );
+    write("dist/index.js", "export const answer = 42;\n");
+    write(
+        "dist/nested/types.d.ts",
+        "export declare const answer: number;\n",
+    );
+    write("dist/.DS_Store", "");
+    write("src/index.ts", "export const answer = 42;\n");
+    write("LICENSE-MIT", "MIT\n");
+    write("README.md", "# demo\n");
+    write("CHANGELOG.md", "nothing\n");
+    write(".npmignore", "dist\n");
+    write("node_modules/dep/index.js", "");
+    write("package-lock.json", "{}");
+    write(".git/HEAD", "ref: refs/heads/main\n");
+    write("bin/demo.js", "#!/usr/bin/env node\n");
+}
+
+#[test]
+fn pack_dry_run_reports_the_files_npm_would_ship() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let dir = project.path().to_str().unwrap();
+    // The working directory is the package, so a dry run that wrote its tarball to `.` would
+    // land where the assertion below looks.
+    let stdout = run(
+        npm_utils()
+            .current_dir(project.path())
+            .args(["pack", dir, "--dry-run", "--json"]),
+        "pack --dry-run --json",
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    // npm 12's shape: one object keyed by the package name.
+    let report = &report["@acme/demo"];
+    assert_eq!(report["id"], "@acme/demo@1.2.3");
+    assert_eq!(report["filename"], "acme-demo-1.2.3.tgz");
+    let paths: Vec<&str> = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "LICENSE-MIT",
+            "README.md",
+            "bin/demo.js",
+            "dist/index.js",
+            "dist/nested/types.d.ts",
+            "package.json",
+        ]
+    );
+    assert_eq!(report["entryCount"], 6);
+    assert!(report["integrity"].as_str().unwrap().starts_with("sha512-"));
+    assert_eq!(report["shasum"].as_str().unwrap().len(), 40);
+    assert!(
+        std::fs::read_dir(project.path()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tgz")),
+        "a dry run writes nothing"
+    );
+}
+
+#[test]
+fn pack_writes_the_tarball_where_asked() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let out = tempfile::tempdir().unwrap();
+    let stdout = run(
+        npm_utils().args([
+            "pack",
+            project.path().to_str().unwrap(),
+            "--pack-destination",
+            out.path().to_str().unwrap(),
+        ]),
+        "pack --pack-destination",
+    );
+    assert_eq!(stdout.trim(), "acme-demo-1.2.3.tgz");
+    let tarball = std::fs::read(out.path().join("acme-demo-1.2.3.tgz")).unwrap();
+    let unpacked = tempfile::tempdir().unwrap();
+    let written = npm_utils::extract::tar_gz(
+        &tarball,
+        unpacked.path(),
+        Some("package/"),
+        npm_utils::extract::Select::All,
+    )
+    .unwrap();
+    assert_eq!(written, 6);
+    assert!(unpacked.path().join("dist/nested/types.d.ts").is_file());
+    assert!(!unpacked.path().join("src").exists());
+}
+
+#[test]
+fn pack_dot_writes_beside_the_sources_without_packing_itself() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let stdout = run(
+        npm_utils().arg("pack").current_dir(project.path()),
+        "pack . in the package directory",
+    );
+    assert_eq!(stdout.trim(), "acme-demo-1.2.3.tgz");
+    let tarball = std::fs::read(project.path().join("acme-demo-1.2.3.tgz")).unwrap();
+    let unpacked = tempfile::tempdir().unwrap();
+    npm_utils::extract::tar_gz(
+        &tarball,
+        unpacked.path(),
+        Some("package/"),
+        npm_utils::extract::Select::All,
+    )
+    .unwrap();
+    assert!(!unpacked.path().join("acme-demo-1.2.3.tgz").exists());
+    assert!(unpacked.path().join("dist/index.js").is_file());
+    assert!(
+        std::fs::read_dir(project.path()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".part")),
+        "no temporary file lingers"
+    );
+}
+
+#[test]
+fn pack_refuses_a_version_that_could_escape_the_destination() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0/../../escape"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join("demo-1.0.0")).unwrap();
+    let out = npm_utils()
+        .args(["pack", project.path().to_str().unwrap()])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("'..'"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!project.path().parent().unwrap().join("escape.tgz").exists());
+    assert!(std::fs::read_dir(project.path()).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".tgz")));
+}
+
+#[test]
+fn pack_refuses_a_hostile_ignore_file() {
+    // A brace bomb in `.npmignore` fails the pack fast, naming the offending rule, and no
+    // tarball is written. The negation bomb of the JavaScript evaluates here: the long file
+    // ships and the tarball is written.
+    let long = "a".repeat(200);
+    let project = |ignore: &str| {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.path().join("index.js"), "x").unwrap();
+        std::fs::write(project.path().join(&long), "x").unwrap();
+        std::fs::write(project.path().join(".npmignore"), ignore).unwrap();
+        project
+    };
+    let pack = |project: &tempfile::TempDir| {
+        npm_utils()
+            .args(["pack", project.path().to_str().unwrap()])
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    let tarballs = |project: &tempfile::TempDir| {
+        std::fs::read_dir(project.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tgz")
+            })
+            .count()
+    };
+
+    let bomb = project("{1..100000000}\n");
+    let out = pack(&bomb);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("{1..100000000}"), "{stderr}");
+    assert_eq!(tarballs(&bomb), 0, "no tarball is written");
+
+    let negation = project("*(!(a))y\n");
+    let out = pack(&negation);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(tarballs(&negation), 1);
+}
+
+#[test]
+fn pack_refuses_by_name_unless_npm_quirks_is_given() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(project.path().join("index.js"), "x").unwrap();
+    std::fs::write(project.path().join(".npmignore"), "!(dist)\n").unwrap();
+    let out = npm_utils()
+        .args(["pack", "--dry-run", "--json", "--npm-quirks"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = npm_utils()
+        .args(["pack", "--dry-run", "--json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("!(dist)"), "{stderr}");
+    assert!(stderr.contains("negation"), "{stderr}");
+    assert!(
+        std::fs::read_dir(project.path()).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tgz")),
+        "no tarball is written"
+    );
+}
+
+#[test]
+fn a_secret_named_by_main_never_reaches_the_written_tarball() {
+    // npm ships `.npmrc` when `main` names it (npm 9.2, npm-packlist 11.3.0); this crate never
+    // does. Check the written tarball, not just the listing.
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"demo","version":"1.0.0","main":".npmrc"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "//registry.npmjs.org/:_authToken=WRITTEN_TOKEN\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("index.js"), "console.log(1)\n").unwrap();
+    let out = tempfile::tempdir().unwrap();
+    run(
+        npm_utils().args([
+            "pack",
+            project.path().to_str().unwrap(),
+            "--pack-destination",
+            out.path().to_str().unwrap(),
+        ]),
+        "pack with a hostile main",
+    );
+    let tarball = std::fs::read(out.path().join("demo-1.0.0.tgz")).unwrap();
+    let unpacked = tempfile::tempdir().unwrap();
+    npm_utils::extract::tar_gz(
+        &tarball,
+        unpacked.path(),
+        Some("package/"),
+        npm_utils::extract::Select::All,
+    )
+    .unwrap();
+    assert!(!unpacked.path().join(".npmrc").exists());
+    assert!(unpacked.path().join("index.js").is_file());
+    for entry in std::fs::read_dir(unpacked.path()).unwrap() {
+        let content = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(!content.contains("WRITTEN_TOKEN"), "the token leaked");
+    }
+}
+
+/// The listing against real npm, on fixtures within what npm and this crate agree on; the
+/// never-ship veto diverges on purpose and lives in tests/pack.rs.
+#[test]
+#[ignore = "needs npm on PATH: compares the listing with npm pack --dry-run --json"]
+fn pack_listing_matches_npm() {
+    let with_files = tempfile::tempdir().unwrap();
+    pack_fixture(with_files.path());
+    let with_ignores = tempfile::tempdir().unwrap();
+    for (path, content) in [
+        (
+            "package.json",
+            r#"{"name":"demo","version":"0.0.1","main":"index.js"}"#,
+        ),
+        ("index.js", ""),
+        ("build/out.js", ""),
+        ("docs/a.md", ""),
+        ("docs/.npmignore", "*.md\n!keep.md\n"),
+        ("docs/keep.md", ""),
+        ("scratch.orig", ""),
+        (".gitignore", "build\n"),
+        (".npmignore", "docs/a.md\n*.@(pem|key)\ndebug.!(txt)\n"),
+        ("LICENCE", ""),
+        ("Readme", ""),
+        ("readme.md~", ""),
+        ("lib/.npmrc", ""),
+        ("lib/x.js", ""),
+        ("secret.pem", ""),
+        ("certs/server.key", ""),
+        ("keep.log", ""),
+        ("debug.log", ""),
+        ("bin/cli.js", ""),
+    ] {
+        let full = with_ignores.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+    }
+    let with_bin_dir = tempfile::tempdir().unwrap();
+    for (path, content) in [
+        (
+            "package.json",
+            r#"{"name":"demo","version":"0.0.1","files":[],"directories":{"bin":"bin"}}"#,
+        ),
+        ("bin/cli.js", ""),
+        ("bin/.hidden", ""),
+        ("lib/x.js", ""),
+    ] {
+        let full = with_bin_dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+    }
+    for dir in [with_files.path(), with_ignores.path(), with_bin_dir.path()] {
+        let theirs = Command::new("npm")
+            .args(["pack", "--dry-run", "--json"])
+            .current_dir(dir)
+            .output()
+            .expect("npm on PATH");
+        assert!(
+            theirs.status.success(),
+            "{}",
+            String::from_utf8_lossy(&theirs.stderr)
+        );
+        let theirs: serde_json::Value =
+            serde_json::from_slice(&theirs.stdout).expect("npm's report parses");
+        let ours = run(
+            npm_utils().args(["pack", dir.to_str().unwrap(), "--dry-run", "--json"]),
+            "pack",
+        );
+        let ours: serde_json::Value = serde_json::from_str(&ours).unwrap();
+        let paths = |report: &serde_json::Value| -> Vec<String> {
+            // npm 12 keys the report by package name; npm 9 to 11 printed an array.
+            let first = match report {
+                serde_json::Value::Array(items) => &items[0],
+                serde_json::Value::Object(map) => map.values().next().unwrap(),
+                other => panic!("unexpected report {other}"),
+            };
+            let mut paths: Vec<String> = first["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["path"].as_str().unwrap().to_string())
+                .collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(paths(&ours), paths(&theirs), "{}", dir.display());
+    }
+}
+
+#[test]
+fn pack_creates_a_missing_destination_directory() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let dest = project.path().join("out").join("nested");
+    let stdout = run(
+        npm_utils().args([
+            "pack",
+            project.path().to_str().unwrap(),
+            "--pack-destination",
+            dest.to_str().unwrap(),
+        ]),
+        "pack --pack-destination",
+    );
+    assert_eq!(stdout.trim(), "acme-demo-1.2.3.tgz");
+    assert!(dest.join("acme-demo-1.2.3.tgz").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_refuses_to_write_through_a_planted_symlink() {
+    let project = tempfile::tempdir().unwrap();
+    pack_fixture(project.path());
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "untouched").unwrap();
+    let dest = project.path().join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let planted = dest.join("acme-demo-1.2.3.tgz");
+    std::os::unix::fs::symlink(&victim, &planted).unwrap();
+    let out = npm_utils()
+        .args([
+            "pack",
+            project.path().to_str().unwrap(),
+            "--pack-destination",
+            dest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a symlink planted at the destination is refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("symlink"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    assert!(
+        std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link itself is left alone"
+    );
+}
+
+#[test]
+fn pack_help_names_the_npm_12_report_shape() {
+    let stdout = run(npm_utils().args(["pack", "--help"]), "pack --help");
+    assert!(stdout.contains("npm 12"), "{stdout}");
 }

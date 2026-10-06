@@ -1,10 +1,10 @@
 [package]
 name = "npm-utils"
-version = "0.6.2"
+version = "0.7.0"
 authors = ["Stefan Grönke <stefan@gronke.net>"]
 homepage = "https://github.com/gronke/npm-utils"
 repository = "https://github.com/gronke/npm-utils"
-description = "Pure-Rust npm toolkit: resolve, download, install/ci, add/remove/upgrade, search, SBOM (CycloneDX/SPDX), and vulnerability audit (npm + OSV) — no Node."
+description = "Pure-Rust npm toolkit: resolve, download, install/ci, add/remove/upgrade, search, pack, SBOM (CycloneDX/SPDX), and vulnerability audit (npm + OSV) — no Node."
 categories = ["development-tools", "command-line-utilities", "web-programming"]
 keywords = ["npm", "registry", "audit", "sbom", "lockfile"]
 license = "MIT"
@@ -33,9 +33,14 @@ semver = "1"
 # npm-install / npm-ci-faithful. Small, widely-trusted crates, well within the crate MSRV.
 sha2 = "0.10"
 base64 = "0.22"
+# The `shasum` of a packed tarball (`pack`) is npm's sha1; the same RustCrypto family as `sha2`.
+sha1 = "0.10"
 # Format the SBOM generation timestamp as RFC 3339 (`sbom::now_rfc3339`). `time` is already in the
 # tree (via `zip`); this only adds its `formatting` feature — no new dependency.
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+# The segment runs of the minimatch matcher: one linear regex each; negations evaluate without
+# a backtracking engine (src/minimatch/seg.rs). MSRV 1.65.
+regex = "1.13"
 
 # CLI only (feature `cli`); optional, so a default library build skips it. clap and its deps build
 # under the crate MSRV (1.88), which is set by `time`, not clap.
@@ -63,6 +68,10 @@ tempfile = "3"
 # `InMemoryTerm` render assertions for `cli::progress` unit tests. A dev-dep builds only for test
 # targets, so the vt100 parser it pulls never reaches release or MSRV builds.
 indicatif = { version = "0.18.6", features = ["in_memory", "unicode-width"] }
+# Property tests over the minimatch grammar (`tests/minimatch_props.rs`, the private invariants in
+# `src/minimatch`); the default features bring the forked runner that turns a hang or an abort into
+# a failing case. MSRV 1.85.
+proptest = "1.11"
 
 [workspace]
 members = ["examples/date-converter"]

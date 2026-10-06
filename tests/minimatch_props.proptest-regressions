@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2bde37c32d0515054a9583f7c3a2cf515df1fb10f674cdc9760500c849f6b634 # shrinks to s = "\\{}"
+cc 75818e8a583939e4dd64eacfd10aff637e112a71c691fd530bdcba8299471750 # shrinks to p = Pattern { comment: false, negate: true, segs: [Plain([Ext { kind: '!', alts: [[Lit("a")]] }])], trailing_slash: false }, path = ""
+cc 9d0aa61f1add028e5a59439fee3d860a18c9f3326b4ded169cf414042b20c005 # shrinks to (p, path) = (Pattern { comment: false, negate: false, segs: [Plain([Ext { kind: '@', alts: [[Ext { kind: '@', alts: [[Star]] }]] }, Ext { kind: '@', alts: [[Ext { kind: '@', alts: [[Ext { kind: '@', alts: [[Star, Lit("cab")], [Ext { kind: '!', alts: [[Lit("aa")], [Lit("bc")], [Lit("b")]] }], [Class { negate: false, items: [Range('a', 'c')] }, Ext { kind: '!', alts: [[Lit("cb")], [Lit("ca")], [Lit("a")]] }]] }, Ext { kind: '!', alts: [[Lit("a")]] }], [Ext { kind: '!', alts: [[Lit("ac")]] }], [Ext { kind: '@', alts: [[Ext { kind: '!', alts: [[Lit("bb")]] }, Star]] }, Ext { kind: '!', alts: [[Lit("b")], [Lit("ca")]] }]] }, Ext { kind: '?', alts: [[Qmark], [Star], [Ext { kind: '!', alts: [[Lit("ca")], [Lit("a")], [Lit("c")]] }, Lit("cb")]] }]] }, Ext { kind: '?', alts: [[Ext { kind: '*', alts: [[Star, Star]] }, Ext { kind: '+', alts: [[Ext { kind: '!', alts: [[Lit("c")], [Lit("a")], [Lit("a")]] }, Brace(Set(["bb", "c", "aa"]))]] }]] }])], trailing_slash: false }, "aaazz9bzz9zz9cbabccccabzz9bbzz9bbzz9bb"), dot = false, strict = false
+cc f8168b324de76eaa6675b44043e1c7d0837f0540fae36ceae9bb04e05ae3e4bb # shrinks to (p, path) = (Pattern { comment: false, negate: false, segs: [Plain([Ext { kind: '!', alts: [[Lit("a")]] }])], trailing_slash: false }, "zz9"), dot = false, strict = true
+cc e35443ac916ba62efd0ff111b02d6e90ceaa8c157cf7ff21721d0113eda6c4e6 # shrinks to p = Pattern { comment: false, negate: false, segs: [Globstar, Plain([Ext { kind: '@', alts: [[Ext { kind: '?', alts: [[Lit("a")]] }, Star]] }])], trailing_slash: false }, path = "."
+cc 4e129f834a61caa1ed3ac6af66355184c8c0a0b7aa78ad678f226fdffb61d3ff # shrinks to s = "?/.."
+cc cbb2fd47a3a62db73767d73f01dc9724c0c7161a67c25b095dde86e65253cf9b # shrinks to p = Pattern { comment: false, negate: false, segs: [Plain([Ext { kind: '@', alts: [[Star]] }, Class { negate: true, items: [Posix("upper")] }]), Plain([Ext { kind: '*', alts: [[Star]] }])], trailing_slash: false }, path = "a/"
+cc 9992bb8018ff4463a4e697139d8fcaea2295d9b26a7d84c2a818931426a48e9e # shrinks to ext = ".", name = ".", dot = true, nocase = false

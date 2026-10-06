@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# `npm` from the sealed container: node:24-slim pinned by digest, no network, no capabilities,
+# a read-only root, with npm 12.1.0 (the version the fixtures pin) mounted from $SEALED_NPM.
+# The working directory is mounted at /data, so relative paths work and absolute ones do not.
+set -euo pipefail
+: "${NODE_IMAGE:?NODE_IMAGE (node:24-slim@sha256:…) is not set}"
+: "${SEALED_NPM:?SEALED_NPM (the extracted npm tarball) is not set}"
+exec docker run --rm -i --network none \
+  --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+  --read-only --tmpfs /tmp:exec \
+  -e HOME=/tmp -e npm_config_cache=/tmp/npm -e npm_config_update_notifier=false \
+  -v "$PWD:/data" -v "$SEALED_NPM:/opt/npm:ro" -w /data \
+  --entrypoint node "$NODE_IMAGE" /opt/npm/bin/npm-cli.js "$@"

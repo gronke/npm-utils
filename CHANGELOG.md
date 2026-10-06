@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com); releases are cut from the `[Unreleased]` section by `gronke/rust-ci`'s `changelog` action.
 
+## [Unreleased]
+
+### Added
+
+- pack: a pure-Rust local package packer as `npm_utils::pack` and the `pack` verb: npm-packlist 11.3.0 file selection pinned by a recorded npm 12.1.0 fixture, pacote's tarball layout streamed through a hashing writer, npm 12's `--json` shape.
+- pack: `.npmrc`, VCS metadata, `node_modules`, root lockfiles, a root `.npm-extension.*` and the patch files of `patchedDependencies` never ship, whatever the manifest says; hostile ignore rules and deep trees fail with an error naming the input.
+- pack: lifecycle scripts, workspaces and package specs are out of scope; a manifest declaring bundled dependencies is refused.
+- pack: an end-to-end job packs real packages, twelve from git at their release commit and twenty registry tarballs unpacked and packed again, against npm 12.1.0 in a sealed node container, and holds the pinned records to the live tools (`tests/pack_e2e.rs`, `ci/sealed-node`).
+- minimatch: npm's glob matcher (minimatch 10.2.5) as `npm_utils::minimatch`, negation-free runs on the regex crate and `!()` groups evaluated as zero-width checks, so the backtracking classes of the JavaScript do not compile at all; pinned by a fixture recorded from the JavaScript; brace, step, globstar and extglob-nesting budgets error instead of truncating, hanging or overflowing the parser stack. `pack` matches its rules with it.
+- minimatch: `Options::max_extglob_nodes` bounds the tree that sequential `!()` groups double, as `Error::Nodes`, where npm's algorithm grows without limit; the end check of a nested group asks its parent once, where the JavaScript doubles the work per level.
+- pack: the rules are read strictly by default: minimatch's ten quirks, named in `npm_utils::minimatch::Quirk`, are off, so ambiguous and unclosed rule syntax fails the pack naming the rule, escapes hold everywhere, `[[:print:]]` and `[[:punct:]]` are corrected; `--npm-quirks` (`pack::Settings { quirks: true }`) reads them as npm does.
+
+### Security
+
+- extract: the inflated stream of an archive is capped at the write cap plus 256 MiB, extension-header bodies and skipped entries included, where tar read a GNU long-name or PAX body whole with no cap at all.
+- extract: an entry name is validated as the archive wrote it, before any selection maps it, so `../x` and `/etc/passwd` are errors in every mode where the install path relativized them; zip names are read as written instead of cleaned, and a NUL or an interior `.` segment is refused in every contained path.
+- path_safety: a write's parent is checked for containment before any directory is created beneath it, where a planted symlink to the outside had its target directories created on the way to the refusal.
+- extract: a file is created exclusively; a regular file already at the destination is unlinked instead of written through (a hardlink's twin keeps its bytes), and a directory, FIFO, device or socket there is refused by name, where a FIFO blocked the extraction.
+- install: a workspace link's climb back to the project is counted on the components the key is written with, where a key spelled `./node_modules/x` climbed one level too many and the link pointed outside the project.
+- pack: the header size of a file comes from the open handle and the bytes are counted against it, so a file that shrinks or grows while it is packed fails the pack instead of misaligning the archive under digests that still verify.
+- pack: a symlinked `.npmignore` or `.gitignore` is refused by name instead of read, in both modes, since a strict refusal quotes the rule at fault and a planted link would print a line of whatever it points at.
+
 ## [0.6.2] - 2026-07-22
 
 ### Security
@@ -136,6 +158,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - cache: content-hash markers, a cross-process build lock, and skip-if-unchanged directory helpers.
 - package_json: read pinned dependency versions from `package.json`.
 
+[Unreleased]: https://github.com/gronke/npm-utils/compare/v0.6.2...HEAD
 [0.6.2]: https://github.com/gronke/npm-utils/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gronke/npm-utils/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gronke/npm-utils/compare/v0.5.3...v0.6.0
