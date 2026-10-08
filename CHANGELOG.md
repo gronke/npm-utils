@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to this project are documented in this file.
-The format follows [Keep a Changelog](https://keepachangelog.com); releases are cut from the `[Unreleased]` section by `gronke/rust-ci`'s `changelog` action.
+The format follows [Keep a Changelog](https://keepachangelog.com); releases are cut from the `[Unreleased]` section by `gronke/ci`'s `changelog` action.
 
 ## [0.6.2] - 2026-07-22
 

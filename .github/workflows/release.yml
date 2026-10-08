@@ -32,14 +32,14 @@ jobs:
 
       - name: Require a verified signed tag (final path only)
         if: github.ref_type == 'tag'
-        uses: gronke/rust-ci/.github/actions/require-signed-tag@v1.2.0
+        uses: gronke/ci/.github/actions/require-signed-tag@v3.0.0
 
-      - uses: gronke/rust-ci/.github/actions/install-toolchain@v1.2.0
+      - uses: gronke/ci/.github/actions/rust/install-toolchain@v3.0.0
         with:
           toolchain: stable
 
       # Tag/version coherence, cargo publish --dry-run, and not-already-on-crates.io.
-      - uses: gronke/rust-ci/.github/actions/check-release-readiness@v1.2.0
+      - uses: gronke/ci/.github/actions/check-release-readiness@v3.0.0
         with:
           package: npm-utils
           expected-version: ${{ steps.expect.outputs.version }}
@@ -60,7 +60,7 @@ jobs:
       # The released changelog section becomes release-notes.md — the draft body
       # and the marker/tag message; the title leads it so the signed tag's
       # subject is the version.
-      - uses: gronke/rust-ci/.github/actions/changelog@v1.2.0
+      - uses: gronke/ci/.github/actions/changelog@v3.0.0
         with:
           mode: notes
           version: ${{ env.VERSION }}
@@ -100,7 +100,7 @@ jobs:
           }
           echo "marker=v${VERSION}-rc${n}" >> "$GITHUB_OUTPUT"
 
-      - uses: gronke/rust-ci/.github/actions/release-guidance@v1.2.0
+      - uses: gronke/ci/.github/actions/release-guidance@v3.0.0
         with:
           version: ${{ env.VERSION }}
           marker-tag: ${{ steps.marker.outputs.marker }}
