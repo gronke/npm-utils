@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# One run per ref: a newer push to main or to a pull request cancels the run in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   workflow_dispatch: # cut-release dispatches the first run explicitly
 
+# One release action at a time per ref: candidate pushes queue behind the draft in flight, nothing is cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
