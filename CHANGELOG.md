@@ -11,6 +11,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - docs: `docs/sources.md` lists what each module follows and the registry's terms the crate works under; the README states the project's independence from npm, Inc.
 - download: every request identifies itself as `npm-utils/<version> (https://github.com/gronke/npm-utils)`, and the one retry waits for the `Retry-After` a 429 or 503 names, capped at 30 seconds.
 - docs: `docs/audit.md` states npm's terms for vulnerability data and where they leave a service built on the crate.
+- download: the `github` feature (on in the CLI, off by default for a library build) — `Credentials` and `set_credentials`, a GitHub token read from `GH_TOKEN`, else `GITHUB_TOKEN`, on the first fetch, sent as `Authorization: Bearer` to `api.github.com` only; `github.com`, `codeload.github.com`, the `githubusercontent.com` hosts and the npm registry never see it, and without the feature no fetch carries an `Authorization` header.
+- download: with the `github` feature, a `github.com` browser URL of a private release asset (`releases/download/<tag>/<file>`) or repository archive (`archive/<ref>.zip`) that answers 404 while a token is set is resolved through the GitHub API, the only form GitHub serves to a token.
+
+### Changed
+
+- download: redirects are followed by the crate itself — one request per hop with the token decided per host, at most five hops, only to an absolute https `Location`; a relative `Location` is refused and a 300 or 304 is an error instead of an empty body.
+- download: the per-request timeout bounds each hop of a redirect chain, not the chain.
+- download: with the `github` feature, a 401, 403 or 404 from `github.com` or `api.github.com` names the private asset and the token variables instead of the bare status.
+- The ureq floor rises to 3.4.2, the version the chain's agent configuration was verified against.
 
 ## [0.6.2] - 2026-07-22
 
@@ -145,6 +154,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com); releases are 
 - cache: content-hash markers, a cross-process build lock, and skip-if-unchanged directory helpers.
 - package_json: read pinned dependency versions from `package.json`.
 
+[Unreleased]: https://github.com/gronke/npm-utils/compare/v0.6.2...HEAD
 [0.6.2]: https://github.com/gronke/npm-utils/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gronke/npm-utils/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gronke/npm-utils/compare/v0.5.3...v0.6.0

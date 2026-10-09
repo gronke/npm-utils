@@ -7,7 +7,9 @@
 //!   package's metadata, resolve the newest version matching a semver range, and
 //!   search the registry ([`Registry::search`](registry::Registry::search)).
 //! - [`download`] — fetch bytes over HTTP (with a retry) and build GitHub
-//!   archive URLs.
+//!   archive URLs; with the `github` feature, `api.github.com` takes a token
+//!   from `GH_TOKEN` or `GITHUB_TOKEN`, so private release assets and archives
+//!   vendor too.
 //! - [`extract`] — unpack `.tar.gz` and `.zip` archives into a destination
 //!   directory, selecting all files, an explicit file map, or a predicate, with
 //!   path-traversal protection.
@@ -48,6 +50,8 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// docs.rs passes `--cfg docsrs` (Cargo.toml's metadata), which marks the feature-gated API as such.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The crate's boxed, thread-safe error type. A single alias so the whole crate shares one error
 /// spelling, errors cross thread boundaries, and a future switch to a structured enum is one edit.
