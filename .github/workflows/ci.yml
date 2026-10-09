@@ -50,6 +50,13 @@ jobs:
           features: ${{ matrix.features }}
           fmt: ${{ matrix.fmt }}
 
+      # A library consumer's own `cargo doc` runs with the default features, so the docs of the
+      # unconditional API must resolve without the gated items; lint-and-test never builds docs.
+      - name: Docs resolve (${{ matrix.name }})
+        run: cargo doc --workspace --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # The package.json / package-lock.json schemas live in the `package_json` module; run their
       # strict spec-conformance suite as a named gate too (a labeled subset of the full test run).
       - name: Spec tests (package_json)

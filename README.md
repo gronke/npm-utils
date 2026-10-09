@@ -11,7 +11,9 @@ See [CLI](#cli).
 
 ```toml
 [dependencies]
-npm-utils = "0.6"   # Rust 1.88+
+npm-utils = "0.7"   # Rust 1.88+
+# a GitHub token for private release assets and archives (see Scope):
+npm-utils = { version = "0.7", features = ["github"] }
 ```
 
 Composable modules — the full API is on **[docs.rs](https://docs.rs/npm-utils)**:
@@ -19,7 +21,7 @@ Composable modules — the full API is on **[docs.rs](https://docs.rs/npm-utils)
 | Module | What it does |
 |---|---|
 | `registry` | Resolve the newest version in a semver range; build tarball URLs; fetch packuments (abbreviated or full). |
-| `download` | Fetch over HTTPS with one retry and a 100 MB cap; build GitHub archive URLs. |
+| `download` | Fetch over HTTPS with one retry and a 100 MB cap; build GitHub archive URLs; with the `github` feature, a token from `GH_TOKEN` or `GITHUB_TOKEN` for private release assets and archives. |
 | `extract` | Unpack `.tar.gz` / `.zip` — all files, an explicit file map, or a predicate — path-traversal-safe. |
 | `integrity` | Verify a tarball's `sha512` Subresource-Integrity before its bytes are trusted. |
 | `install` | Build a real `node_modules/`: resolve a `package.json` (`npm install`) or reproduce a `package-lock.json` exactly (`npm ci`), every tarball integrity-checked. Hoisted **workspaces** are reproduced too — member/`file:` links are symlinked into `node_modules/`. |
@@ -230,7 +232,8 @@ See [`examples/date-converter`](examples/date-converter) for a runnable Lit + `T
 ## Scope
 
 Not a general `npm`: npm-utils vendors **public-registry** packages and reproduces a committed `package-lock.json` — that's the remit.
-So: **no lifecycle scripts** (by design), **public registry only** (no `.npmrc`/auth), and `node_modules()` resolves a **flat, prod-only** tree that errors on a version conflict npm would nest — install from a lockfile (`from_lockfile`/`ci`) for a full tree.
+So: **no lifecycle scripts** (by design), the **public registry stays unauthenticated** (no `.npmrc`), and `node_modules()` resolves a **flat, prod-only** tree that errors on a version conflict npm would nest — install from a lockfile (`from_lockfile`/`ci`) for a full tree.
+GitHub is the one exception, behind the `github` feature (on in the CLI, off for a library build so no token is picked up by accident): `api.github.com` takes a token from `GH_TOKEN` or `GITHUB_TOKEN`, `github.com` never sees it, and a private release asset's or repository archive's browser URL is resolved through the GitHub API when a token is set, which npm itself cannot do; other GitHub hosts stay unauthenticated.
 Anything unsupported — a dist-tag like `next`, `overrides`, lockfile v1 — fails with a clear error rather than silently.
 
 ## License

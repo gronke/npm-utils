@@ -1,6 +1,6 @@
 [package]
 name = "npm-utils"
-version = "0.6.3"
+version = "0.7.0"
 authors = ["Stefan Grönke <stefan@gronke.net>"]
 homepage = "https://github.com/gronke/npm-utils"
 repository = "https://github.com/gronke/npm-utils"
@@ -12,14 +12,31 @@ edition = "2021"
 rust-version = "1.88"   # floor set by the `time` dependency (MSRV 1.88); guarded by the CI msrv job
 include = ["src/**/*.rs", "Cargo.toml", "/README.md", "LICENSE", "/LICENSES/**", "/REUSE.toml"]
 
+# docs.rs builds with the default features unless told otherwise; the `github` API is part of the
+# documented surface, and `--cfg docsrs` marks it as gated.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # The `npm-utils` / `cargo-npm-utils` command-line tool (pure-Rust `npm install` / `ci` / `add` /
 # `init` / `upgrade`). Opt-in so library consumers never pull `clap`: install the CLI with
 # `cargo install npm-utils --features cli`.
-cli = ["dep:clap", "dep:indicatif"]
+cli = ["dep:clap", "dep:indicatif", "github"]
+# A GitHub token from `GH_TOKEN`, else `GITHUB_TOKEN`, sent to `api.github.com`, and the second attempt
+# through the GitHub API for a `github.com` browser URL of a private release asset or archive that
+# answers 404. Off by default, so a library build never picks up a token from its environment by
+# accident; the CLI reads it the way `gh` does.
+github = ["dep:percent-encoding"]
 
 [dependencies]
-ureq = { version = "3.0", features = ["rustls", "platform-verifier"], default-features = false }
+# 3.4.2 is the version the download chain's agent configuration was verified against:
+# `max_redirects(0)` and `http_status_as_error(false)` at agent level, so the cached TLS config
+# is reused across hops. Its MSRV is 1.85, under the crate's 1.88.
+ureq = { version = "3.4.2", features = ["rustls", "platform-verifier"], default-features = false }
+# Decodes the tag and file segments of a GitHub browser URL (`github` feature); already in the
+# tree through ureq.
+percent-encoding = { version = "2.3", optional = true }
 flate2 = "1.1"
 tar = "0.4"
 zip = { version = "7", default-features = false, features = ["deflate", "time"] }
